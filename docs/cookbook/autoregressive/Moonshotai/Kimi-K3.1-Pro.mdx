@@ -256,7 +256,7 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
   - The host pools pin about 190 GB per GPU at DCP8, about 1.5 TB per node. `HSA_USERPTR_FOR_PAGED_MEM=0` backs them with `hipHostMalloc` (GTT memory, which never migrates); page migration in registered host memory stalls every GPU queue.
   - L3 has not run on MI350X / MI355X.
 - **Memory.** `SGLANG_ROCM_RUNTIME_RESERVE_GB` (10 at DCP8, 6 at TP8) keeps GPU memory free for the HIP queues' scratch, which is allocated outside torch. `--mem-fraction-static` 0.87 or 0.88 overflowed GTT at startup or ran slower on the single-node recipe.
-- **`--prefill-decode-interval 16`** runs 16 decode steps after each prefill batch before the next prefill. At 48 agents, 16 matched the throughput of 8 with 16% more interactivity; p90 TTFT rose from 5.2 s to 10.4 s.
+- **`--prefill-decode-interval 16`** runs 16 decode steps after each prefill batch before the next prefill. At 48 agents, 16 matched the throughput of 8 with 16% more interactivity; p90 TTFT rose from 5.2 s to 10.4 s. With an explicit `--max-running-requests`, the interval holds prefill only once the decode batch reaches 90% of it (`--prefill-decode-interval-min-bs`, derived by default; set 0 to hold at any batch size).
 - **MI350X** runs the MI355X commands, single-node and 1P1D.
 
 ## 3. Advanced Usage
