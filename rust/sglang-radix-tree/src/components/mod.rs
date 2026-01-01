@@ -264,6 +264,19 @@ pub trait TreeComponent<K: ChildKeyType> {
     ) {
     }
 
+    /// Record a request's state checkpoint at `new_id` after it held `prev_id`,
+    /// for superseded-first host eviction; only the Mamba component tracks it.
+    fn note_checkpoint(
+        &self,
+        _tree_core: &mut UnifiedTreeCore<K>,
+        _prev_id: NodeIdx_,
+        _new_id: NodeIdx_,
+        _supersedes_prev: bool,
+        _output_tail: bool,
+        _state_inserted: bool,
+    ) {
+    }
+
     /// Redistribute component data between `new_parent` and `child` when a node is
     /// split; `new_parent` is the newly created prefix node.
     // Python reference — base.py::TreeComponent.redistribute_on_node_split:

@@ -1934,6 +1934,11 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # The hicache host Mamba pool evicts states a later checkpoint superseded
+    # (the state a request resumed from, its between-chunk states, the output
+    # tail a later prompt forked away from) before it walks the host LRU.
+    # Set 0 for plain host-LRU order.
+    SGLANG_OPT_MAMBA_EVICT_SUPERSEDED_FIRST = EnvBool(True)
     # PD decode with --disaggregation-decode-enable-radix-cache on a hybrid-SSM
     # model: the radix tree keeps FULL KV only. Prefill always sends a
     # request's final recurrent state and decode never computes a prompt, so a

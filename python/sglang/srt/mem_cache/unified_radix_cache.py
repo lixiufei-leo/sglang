@@ -263,6 +263,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # each request's own state slot when it leaves (state-free PD decode).
         self.request_mamba_only = params.request_mamba_only
         assert not (self.request_mamba_only and self.is_mamba_enabled)
+        self.mamba_evicts_superseded_first = (
+            self.is_mamba_enabled and envs.SGLANG_OPT_MAMBA_EVICT_SUPERSEDED_FIRST.get()
+        )
         # Whether the mamba extra (ping-pong) buffer is enabled.
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
@@ -299,6 +302,16 @@ class UnifiedRadixCache(BasePrefixCache):
             params=tree_params,
             components=self.components,
         )
+        if (
+            self.mamba_evicts_superseded_first
+            and not self.tree_core.tracks_mamba_checkpoints()
+        ):
+            logger.warning(
+                "The Rust TreeCore extension predates superseded-first Mamba host "
+                "eviction, so the host Mamba pool evicts in plain LRU order; "
+                "rebuild the extension from rust/sglang-radix-tree."
+            )
+            self.mamba_evicts_superseded_first = False
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
@@ -402,6 +415,11 @@ class UnifiedRadixCache(BasePrefixCache):
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
             f"Tree Core: {type(self.tree_core).__name__}"
         )
+        if self.is_mamba_enabled:
+            logger.info(
+                "Mamba host eviction takes superseded states first: "
+                f"{self.mamba_evicts_superseded_first}"
+            )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -1663,6 +1681,23 @@ class UnifiedRadixCache(BasePrefixCache):
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
         )
+
+        if (
+            self.mamba_evicts_superseded_first
+            and self.host_pool_group is not None
+            and req.last_node is not None
+        ):
+            past_prompt = page_aligned_len > len(prompt_key)
+            self.tree_core.note_mamba_checkpoint(
+                req.last_node,
+                new_last_node,
+                # The deepest prompt state stays unmarked when the request moves
+                # on to its output: a turn whose prompt forks there resumes from it.
+                supersedes_prev=not past_prompt
+                or req.kv.cache_protected_len > len(prompt_key),
+                output_tail=past_prompt,
+                state_inserted=not result.mamba_exist,
+            )
 
         self.unlock(req.lock)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is

@@ -2049,6 +2049,28 @@ macro_rules! tree_core_methods {
                     .map_err(node_access_error)
             }
 
+            /// Record a request's Mamba checkpoint for superseded-first host eviction.
+            fn note_mamba_checkpoint(
+                &self,
+                py: Python<'_>,
+                prev_node_id: NodeId,
+                new_node_id: NodeId,
+                supersedes_prev: bool,
+                output_tail: bool,
+                state_inserted: bool,
+            ) -> PyResult<()> {
+                py.detach(|| {
+                    self.core().note_mamba_checkpoint(
+                        prev_node_id,
+                        new_node_id,
+                        supersedes_prev,
+                        output_tail,
+                        state_inserted,
+                    )
+                })
+                .map_err(node_access_error)
+            }
+
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 let result = py
@@ -3437,6 +3459,28 @@ macro_rules! tree_core_binding {
                 copied: Vec<NodeId>,
             ) -> PyResult<usize> {
                 catch_native_panic(|| self.inner.mark_write_back_queued(py, node_id, copied))
+            }
+
+            /// Record a request's Mamba checkpoint for superseded-first host eviction.
+            fn note_mamba_checkpoint(
+                &self,
+                py: Python<'_>,
+                prev_node_id: NodeId,
+                new_node_id: NodeId,
+                supersedes_prev: bool,
+                output_tail: bool,
+                state_inserted: bool,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.note_mamba_checkpoint(
+                        py,
+                        prev_node_id,
+                        new_node_id,
+                        supersedes_prev,
+                        output_tail,
+                        state_inserted,
+                    )
+                })
             }
 
             /// Release a node's device KV once its host copy exists.

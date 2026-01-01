@@ -191,6 +191,10 @@ pub struct Node<K: ChildKeyType> {
     pub write_through_pending_id: Option<usize>,
     /// Queued for its demote by the running write-back eviction walk.
     pub write_back_queued: bool,
+    /// Mamba state the host pool evicts ahead of its LRU; cleared by a match.
+    pub mamba_superseded: bool,
+    /// Mamba state checkpointed past its request's prompt (the output region).
+    pub mamba_output_tail: bool,
     /// Load-back anchor currently reading this node's Full host slots.
     /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
@@ -429,6 +433,8 @@ impl<K: ChildKeyType> Node<K> {
             rotation_base: None,
             write_through_pending_id: None,
             write_back_queued: false,
+            mamba_superseded: false,
+            mamba_output_tail: false,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
@@ -457,6 +463,8 @@ impl<K: ChildKeyType> Node<K> {
             rotation_base: None,
             write_through_pending_id: None,
             write_back_queued: false,
+            mamba_superseded: false,
+            mamba_output_tail: false,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,

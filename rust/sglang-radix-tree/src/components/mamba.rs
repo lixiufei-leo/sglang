@@ -61,6 +61,117 @@ fn least_common_multiple(lhs: usize, rhs: usize) -> usize {
 }
 
 impl MambaComponent {
+    fn holds_state<K: ChildKeyType>(node: &Node<K>) -> bool {
+        node.has_device_value(MAMBA) || node.has_host_value(MAMBA)
+    }
+
+    /// Subtree roots hanging off the prev -> new path, down to the first state
+    /// on it; None when prev is not an ancestor of new.
+    fn branches_off_path<K: ChildKeyType>(
+        tree_core: &UnifiedTreeCore<K>,
+        prev_id: NodeIdx_,
+        new_id: NodeIdx_,
+    ) -> Option<Vec<NodeIdx_>> {
+        let mut path = Vec::new();
+        let mut cursor = new_id;
+        while cursor != prev_id {
+            path.push(cursor);
+            cursor = tree_core.arena.node(cursor).try_parent()?;
+        }
+        let mut branches = Vec::new();
+        let mut parent = prev_id;
+        for &on_path in path.iter().rev() {
+            branches.extend(
+                tree_core
+                    .arena
+                    .node(parent)
+                    .children
+                    .values()
+                    .copied()
+                    .filter(|&child| child != on_path),
+            );
+            if Self::holds_state(tree_core.arena.node(on_path)) {
+                break;
+            }
+            parent = on_path;
+        }
+        Some(branches)
+    }
+
+    /// One host-LRU walk from the least-recent state: internal nodes tombstone
+    /// privately, host leaves evict atomically.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_host_eviction<K: ChildKeyType>(
+        tree_core: &mut UnifiedTreeCore<K>,
+        num_tokens: usize,
+        tracker: &mut HashMap<ComponentType, usize>,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+        superseded_only: bool,
+    ) {
+        let ct = MAMBA;
+        let mut x = tree_core
+            .host_lru_list(MAMBA)
+            .get_lru_no_lock(&tree_core.arena);
+        loop {
+            if tracker[&ct] >= num_tokens {
+                break;
+            }
+            let Some(cur) = x else {
+                break;
+            };
+            if !tree_core.host_lru_list(MAMBA).in_list(Some(cur)) {
+                if !superseded_only {
+                    break;
+                }
+                // An eviction took the saved neighbour with it; rescan the rest.
+                x = tree_core
+                    .host_lru_list(MAMBA)
+                    .get_lru_no_lock(&tree_core.arena);
+                continue;
+            }
+            let x_next = tree_core
+                .host_lru_list(MAMBA)
+                .get_prev_no_lock(cur, &tree_core.arena);
+            if superseded_only && !tree_core.arena.node(cur).mamba_superseded {
+                x = x_next;
+                continue;
+            }
+            // The host LRU filters Mamba's own locks. A Full load-back pin may
+            // cover an ancestor whose Mamba state is not being transferred.
+            if tree_core.evictable_host_leaves.contains(cur) {
+                // Host leaf: atomic eviction (all components host + delete)
+                tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees, cache_actions);
+            } else {
+                // Internal: tombstone Mamba + cascade
+                assert!(
+                    tree_core.arena.has_host_value(cur, MAMBA),
+                    "Mamba host LRU member {cur} has no host value"
+                );
+                tree_core.evict_component_and_detach_lru_(
+                    cur,
+                    ct,
+                    device_frees,
+                    host_frees,
+                    cache_actions,
+                    EvictLayer::Host,
+                    Some(tracker),
+                );
+                tree_core.cascade_evict_(
+                    cur,
+                    ct,
+                    tracker,
+                    device_frees,
+                    host_frees,
+                    cache_actions,
+                    EvictLayer::Host,
+                );
+            }
+            x = x_next;
+        }
+    }
+
     // Tier-selected mamba slot read for the lock paths; `host` picks the host slot.
     fn has_value<K: ChildKeyType>(node: &Node<K>, host: bool) -> bool {
         if host {
@@ -140,6 +251,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         match phase {
             LRURefreshPhase::Walkdown => {}
             LRURefreshPhase::MatchEnd => {
+                tree_core.arena.node_mut(node_id).mamba_superseded = false;
                 if tree_core.arena.has_device_value(node_id, MAMBA) {
                     tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
                 }
@@ -246,6 +358,56 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         let tick = tree_core.arena.get_and_bump_access_counter();
         tree_core.arena.node_mut(node_id).last_access_counter = tick;
         result.mamba_exist = true;
+    }
+
+    /// Mark what a request's checkpoint at `new_id` supersedes, after it held
+    /// `prev_id`: that state unless two live continuations fork from it, and
+    /// output tails the new path forks away from. The walk descends stateless
+    /// subtrees hanging off the path until it meets a state.
+    fn note_checkpoint(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        prev_id: NodeIdx_,
+        new_id: NodeIdx_,
+        supersedes_prev: bool,
+        output_tail: bool,
+        state_inserted: bool,
+    ) {
+        let new = tree_core.arena.node_mut(new_id);
+        if !Self::holds_state(new) {
+            return;
+        }
+        if !output_tail {
+            new.mamba_output_tail = false;
+            new.mamba_superseded = false;
+        } else if state_inserted {
+            new.mamba_output_tail = true;
+            new.mamba_superseded = false;
+        }
+        let prev = tree_core.arena.node(prev_id);
+        if !supersedes_prev || prev_id == new_id || prev.is_root() || !Self::holds_state(prev) {
+            return;
+        }
+        let Some(mut branches) = Self::branches_off_path(tree_core, prev_id, new_id) else {
+            return;
+        };
+        // The new path is one live continuation of prev's state.
+        let mut live = 1;
+        while let Some(node_id) = branches.pop() {
+            let node = tree_core.arena.node_mut(node_id);
+            if !Self::holds_state(node) {
+                branches.extend(node.children.values().copied());
+                continue;
+            }
+            if node.mamba_output_tail {
+                node.mamba_superseded = true;
+            }
+            if !node.mamba_superseded {
+                live += 1;
+            }
+        }
+        tree_core.arena.node_mut(prev_id).mamba_superseded = live < 2;
+        tree_core.mamba_superseded_marked = true;
     }
 
     /// Mamba data stays on the original leaf; the new prefix node gets none.
@@ -394,6 +556,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if !host_lru.in_list(Some(node_id)) {
                 host_lru.insert_mru(node_id);
             }
+        }
+
+        let node = tree_core.arena.node_mut(node_id);
+        if !Self::holds_state(node) {
+            node.mamba_superseded = false;
+            node.mamba_output_tail = false;
         }
 
         (freed, host_freed)
@@ -803,8 +971,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         }
     }
 
-    /// Evict mamba host resources: internal nodes tombstone privately, host
-    /// leaves evict atomically.
+    /// Evict mamba host resources: superseded states in host-LRU order, then
+    /// the host LRU.
     fn drive_host_eviction(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -814,55 +982,26 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         cache_actions: &mut CacheActions,
     ) {
-        let ct = MAMBA;
-        let mut x = tree_core
-            .host_lru_list(MAMBA)
-            .get_lru_no_lock(&tree_core.arena);
-        loop {
-            if tracker[&ct] >= num_tokens {
-                break;
-            }
-            let Some(cur) = x else {
-                break;
-            };
-            if !tree_core.host_lru_list(MAMBA).in_list(Some(cur)) {
-                break;
-            }
-            let x_next = tree_core
-                .host_lru_list(MAMBA)
-                .get_prev_no_lock(cur, &tree_core.arena);
-            // The host LRU filters Mamba's own locks. A Full load-back pin may
-            // cover an ancestor whose Mamba state is not being transferred.
-            if tree_core.evictable_host_leaves.contains(cur) {
-                // Host leaf: atomic eviction (all components host + delete)
-                tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees, cache_actions);
-            } else {
-                // Internal: tombstone Mamba + cascade
-                assert!(
-                    tree_core.arena.has_host_value(cur, MAMBA),
-                    "Mamba host LRU member {cur} has no host value"
-                );
-                tree_core.evict_component_and_detach_lru_(
-                    cur,
-                    ct,
-                    device_frees,
-                    host_frees,
-                    cache_actions,
-                    EvictLayer::Host,
-                    Some(tracker),
-                );
-                tree_core.cascade_evict_(
-                    cur,
-                    ct,
-                    tracker,
-                    device_frees,
-                    host_frees,
-                    cache_actions,
-                    EvictLayer::Host,
-                );
-            }
-            x = x_next;
+        if tree_core.mamba_superseded_marked {
+            Self::walk_host_eviction(
+                tree_core,
+                num_tokens,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+                /* superseded_only = */ true,
+            );
         }
+        Self::walk_host_eviction(
+            tree_core,
+            num_tokens,
+            tracker,
+            device_frees,
+            host_frees,
+            cache_actions,
+            /* superseded_only = */ false,
+        );
     }
 }
 
