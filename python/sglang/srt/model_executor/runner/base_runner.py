@@ -265,6 +265,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_dcp_ll_combine()
         self._pre_initialize_pcie_ipc_workspace()
 
         # Model-owned communication resources may depend on the resolved
@@ -350,6 +351,16 @@ class BaseRunner(ABC):
                 get_parallel().dcp_group,
                 self.model_runner.model_config.num_attention_heads,
             )
+
+    def _pre_initialize_dcp_ll_combine(self):
+        """Resolve the gfx950 LL communicator of the one-kernel DCP merge (a2a
+        backend) before graph capture: its first use is a TP-group collective."""
+        if not get_parallel().dcp_enabled or get_parallel().dcp_comm_backend != "a2a":
+            return
+
+        from sglang.srt.layers.dcp import init_dcp_ll_combine
+
+        init_dcp_ll_combine(get_parallel().dcp_group)
 
     def _pre_initialize_pcie_ipc_workspace(self):
         """Build the PCIe-IPC all-reduce workspace before graph capture.

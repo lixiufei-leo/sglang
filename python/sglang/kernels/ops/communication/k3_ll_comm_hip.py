@@ -1,5 +1,6 @@
 """The communicator of Kimi-K3's TP8 LL collectives on gfx950 (csrc/kimi_k3/comm/ll_hip.cuh):
-the attention-residual read's stream gather (attention/k3_attn_res_read_hip).
+the attention-residual read's stream gather (attention/k3_attn_res_read_hip) and the
+DCP8 MLA decode merge (attention/dcp_ll_combine_hip).
 
 Their scratch is the meta buffer tail of a dedicated aiter CustomAllreduce,
 which is never used for anything else: one region and one row of flags per
@@ -18,16 +19,23 @@ if TYPE_CHECKING:
 WORLD_SIZE: int = 8
 # The largest graphed target verify (64 requests x 6 rows); must match kMaxRows.
 MAX_ROWS: int = 384
-# Per region: 2 epochs x world x rows x lines-per-row x 16 B (8 payload bytes a
-# line). The kernels hardcode the region order and line counts.
-_LINES_PER_ROW = (2 * 7168 // WORLD_SIZE // 8,)  # gather read: an H / 8 bf16 slice
-_SCRATCH_BYTES: int = sum(2 * WORLD_SIZE * MAX_ROWS * n * 16 for n in _LINES_PER_ROW)
+# Per region: 2 epochs x world x rows x lines-per-row x 16 B. The kernels hardcode
+# their line counts; the gather read's region comes first.
+_LINES_PER_ROW = (
+    2 * 7168 // WORLD_SIZE // 8,  # gather read: an H / 8 bf16 slice, 8 B a line
+    12 * 128 // 8 + 12,  # DCP merge: 12 heads of 128 bf16, 16 B a line, then their LSEs
+)
+_REGION_BYTES = tuple(2 * WORLD_SIZE * MAX_ROWS * n * 16 for n in _LINES_PER_ROW)
+DCP_REGION_OFFSET: int = _REGION_BYTES[0]
+_SCRATCH_BYTES: int = sum(_REGION_BYTES)
 
 
 class LLComm(NamedTuple):
     comm: CustomAllreduce
     # rank-local flags: [MAX_ROWS] attention-residual gather rows
     epochs: torch.Tensor
+    # rank-local flags: [MAX_ROWS] DCP merge rows
+    dcp_epochs: torch.Tensor
 
 
 def create_ll_comm(cpu_group, device: torch.device) -> Optional[LLComm]:
@@ -40,4 +48,5 @@ def create_ll_comm(cpu_group, device: torch.device) -> Optional[LLComm]:
     if comm.disabled or comm.world_size != WORLD_SIZE:
         return None
     epochs = torch.zeros(MAX_ROWS, dtype=torch.int32, device=device)
-    return LLComm(comm, epochs)
+    dcp_epochs = torch.zeros(MAX_ROWS, dtype=torch.int32, device=device)
+    return LLComm(comm, epochs, dcp_epochs)
