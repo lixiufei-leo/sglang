@@ -473,7 +473,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         mamba_max_states_per_path = (
-            get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
+            get_exec().mamba.mamba_max_states_per_path if has_mamba else None
         )
 
         self._binding = self._binding_class()(
@@ -506,7 +506,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 ),
                 mamba_max_states_per_path=(
                     mamba_max_states_per_path
-                    if mamba_max_states_per_path >= 0
+                    if mamba_max_states_per_path is not None
+                    and mamba_max_states_per_path >= 0
                     else None
                 ),
                 mamba_host_only_checkpoint=(

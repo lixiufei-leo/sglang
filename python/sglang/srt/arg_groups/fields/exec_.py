@@ -549,12 +549,17 @@ class ExecMamba(msgspec.Struct):
         ),
     ] = None
     mamba_max_states_per_path: A[
-        int,
-        "Maximum number of cached Mamba states retained per root-to-tail path "
-        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
-        "interior states beyond the cap are removed while their full KV remains. "
-        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
-    ] = -1
+        Optional[int],
+        Arg(
+            help="Maximum number of cached Mamba states retained per root-to-tail path "
+            "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
+            "interior states beyond the cap are removed while their full KV remains. "
+            "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer. "
+            "By default, this is -1 except for Kimi-K3.1 with --enable-hierarchical-cache, "
+            "which uses 1.",
+            resolvable=True,
+        ),
+    ] = None
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",

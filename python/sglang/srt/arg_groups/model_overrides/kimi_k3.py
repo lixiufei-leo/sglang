@@ -186,7 +186,18 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
     overrides.update(_kimi_k31_lossless_defaults(cfg))
     overrides.update(_kimi_k31_prefill_decode_interval_min_bs_default(cfg))
+    overrides.update(_kimi_k31_mamba_max_states_per_path_default(cfg))
     return overrides
+
+
+def _kimi_k31_mamba_max_states_per_path_default(cfg: Any) -> dict:
+    """With HiCache, keep one KDA state per radix path unless set: older
+    checkpoints of a session are dropped while their KV stays cached, so the
+    KDA host pool holds the tails of more sessions."""
+    if cfg.mamba_max_states_per_path is not None or not cfg.enable_hierarchical_cache:
+        return {}
+    logger.info("Kimi-K3.1 with HiCache defaults --mamba-max-states-per-path to 1.")
+    return {"mamba_max_states_per_path": 1}
 
 
 def _kimi_k31_prefill_decode_interval_min_bs_default(cfg: Any) -> dict:
