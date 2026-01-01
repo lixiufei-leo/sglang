@@ -6,8 +6,14 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits_verify
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.kernels.ops.attention.dsa import (
+    aiter_paged_mqa_logits_persistent_schedule,
+    aiter_paged_mqa_logits_verify,
+)
+from sglang.kernels.ops.attention.dsa.dcp_topk_hip import supports_dcp_topk_hip
+from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k, get_dcp_lens
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import print_info_once
 
 
@@ -42,6 +48,8 @@ _verify_request_block_tables = _PerForwardMemo()
 # FP4 index-K logits: each request's page-table row and its first query row
 _fp4_request_block_tables = _PerForwardMemo()
 _fp4_query_starts = _PerForwardMemo()
+# Generic paged-logits path: per-row work table balanced over the real lengths.
+_paged_logits_schedule = _PerForwardMemo()
 
 
 def _localize_store_loc(
@@ -72,6 +80,49 @@ def dcp_local_lens(
         key=(id(forward_batch), lens.data_ptr(), lens.shape),
         layer_id=layer_id,
         compute=lambda: get_dcp_lens(lens, dcp_size, dcp_rank).to(lens.dtype),
+    )
+
+
+def log_long_row_balancing(
+    *, index_topk: int, aiter_logits: bool, preshuffle: bool
+) -> None:
+    """One startup line per rank: the two long-row switches as read here, and whether
+    this indexer's decode paths take what they gate."""
+    chunked_env = envs.SGLANG_DSA_DCP_TOPK_CHUNKED.get()
+    schedule_env = envs.SGLANG_DSA_MQA_PERSISTENT_SCHEDULE.get()
+    world = get_parallel().attn_dcp_size if dsa_shards_index_k() else 1
+    # dsa_dcp_sharded_hip.dcp_global_topk's gate for the HIP local top-k
+    chunked = (
+        chunked_env
+        and world > 1
+        and supports_dcp_topk_hip(index_topk, world)
+        and not get_exec().features.enable_return_indexer_topk
+    )
+    # Indexer._get_topk_paged's gate; FP4 index-K and shared-index-K verify logits
+    # run their own kernels and take no schedule
+    schedule = schedule_env and aiter_logits and preshuffle
+    print_info_once(
+        f"DSA indexer long-row balancing (ROCm, index-K dcp_size={world}): "
+        f"local top-k split over blocks={chunked} "
+        f"(SGLANG_DSA_DCP_TOPK_CHUNKED={chunked_env}), "
+        f"paged logits persistent schedule={schedule} "
+        f"(SGLANG_DSA_MQA_PERSISTENT_SCHEDULE={schedule_env})"
+    )
+
+
+def paged_logits_persistent_schedule(
+    forward_batch, layer_id: int, lens: torch.Tensor, max_seq_len: int
+) -> torch.Tensor:
+    """The aiter persistent schedule for one query row per entry of lens, shared by the
+    forward's layers."""
+    print_info_once(
+        "DSA indexer: paged logits take aiter's persistent schedule over the rows' "
+        "real lengths"
+    )
+    return _paged_logits_schedule.get(
+        key=(id(forward_batch), lens.data_ptr(), lens.shape, max_seq_len),
+        layer_id=layer_id,
+        compute=lambda: aiter_paged_mqa_logits_persistent_schedule(lens, max_seq_len),
     )
 
 

@@ -499,6 +499,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+        if _use_aiter:
+            dsa_indexer_hip.log_long_row_balancing(
+                index_topk=self.index_topk,
+                aiter_logits=self.paged_mqa_logits_backend.is_aiter(),
+                preshuffle=_use_aiter_preshuffle,
+            )
 
         # gfx950 fused decode indexer. All three conditions below must hold; the
         # runtime half is dsa/utils.gfx950_fused_indexer_runtime_ok.
@@ -1604,16 +1610,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 block_kv,
             )
         elif self.paged_mqa_logits_backend.is_aiter():
+            # under DCP, block_tables cover only this rank's index-K shard
+            row_lens = seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32
+            schedule = None
+            # The schedule names the query rows itself, one per length: padded
+            # hidden states (more q rows than lengths) keep the fixed split.
+            if (
+                _use_aiter_preshuffle
+                and envs.SGLANG_DSA_MQA_PERSISTENT_SCHEDULE.get()
+                and row_lens.dim() == 1
+                and row_lens.shape[0] == q_fp8.shape[0]
+            ):
+                schedule = dsa_indexer_hip.paged_logits_persistent_schedule(
+                    forward_batch, layer_id, row_lens, max_seq_len
+                )
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                # under DCP, block_tables cover only this rank's index-K shard
-                seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32,
+                row_lens,
                 block_tables,
                 max_seq_len,
                 preshuffle=_use_aiter_preshuffle,
                 kv_block_size=block_kv,
+                persistent_schedule=schedule,
             )
         elif _is_xpu:
             logits = sgl_fp8_paged_mqa_logits(
