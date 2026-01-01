@@ -59,6 +59,11 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     default_belief_policy,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.device_handover import (
+    DeviceHandoverLog,
+    DeviceIndicesByPool,
+    device_handover,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -207,6 +212,8 @@ class _OngoingPrefetch(NamedTuple):
 class UnifiedRadixCache(BasePrefixCache):
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
+    # Shared with the HiCache controller by init_hicache; None logs nothing.
+    _device_handovers: Optional[DeviceHandoverLog] = None
 
     def __init__(
         self,
@@ -572,6 +579,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
             self.tree_core.set_hicache_enabled()
+            # Full and Mamba values reach the tree only through insert, which
+            # names them; other components keep the whole-stream write fence.
+            if self.host_memory_mode == "cache" and set(self.tree_components) <= {
+                ComponentType.FULL,
+                ComponentType.MAMBA,
+            }:
+                self._device_handovers = DeviceHandoverLog(self.cache_controller)
+                self.cache_controller.device_handovers = self._device_handovers
             if self.supports_swa():
                 swa = self.component_of(TREE_WINDOW)
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
@@ -771,26 +786,42 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         # External linker offloads (BackupKV) issued by this insert carry its session.
         self.insert_session_id = params.session_id
-        # Pump the resumable insert, applying each step's actions at its barrier.
-        try:
-            step = self.tree_core.begin_insert(params)
-            while True:
-                self._apply_cache_actions(step.actions)
-                if step.result is not None:
-                    # Walk actions flow through the steps; the result is action-free.
-                    assert not step.result.cache_actions
-                    if self.buffer_pipeline is not None:
-                        self.buffer_pipeline.on_insert_complete(step.result)
-                    return step.result
-                step = self.tree_core.resume_insert()
-        finally:
-            # Drain still-pending actions so frees reach the allocator on abort.
+        with device_handover(self._device_handovers, self._handed_indices(params)):
+            # Pump the resumable insert, applying each step's actions at its barrier.
             try:
-                self._apply_cache_actions(self.tree_core.end_insert())
+                step = self.tree_core.begin_insert(params)
+                while True:
+                    self._apply_cache_actions(step.actions)
+                    if step.result is not None:
+                        # Walk actions flow through the steps;
+                        # the result is action-free.
+                        assert not step.result.cache_actions
+                        if self.buffer_pipeline is not None:
+                            self.buffer_pipeline.on_insert_complete(step.result)
+                        return step.result
+                    step = self.tree_core.resume_insert()
             finally:
-                self.insert_session_id = None
-            if self.buffer_pipeline is not None:
-                self.buffer_pipeline.end_insert_walk()
+                # Drain still-pending actions so frees reach the allocator on abort.
+                try:
+                    self._apply_cache_actions(self.tree_core.end_insert())
+                finally:
+                    self.insert_session_id = None
+                if self.buffer_pipeline is not None:
+                    self.buffer_pipeline.end_insert_walk()
+
+    @staticmethod
+    def _handed_indices(params: InsertParams) -> Optional[DeviceIndicesByPool]:
+        """The device rows an insert gives the tree; None when it names none."""
+        if params.value is None:
+            return None
+        return {
+            PoolName.KV: [params.value],
+            PoolName.MAMBA: [
+                slots
+                for slots in (params.mamba_value, params.mamba_host_src)
+                if slots is not None
+            ],
+        }
 
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:

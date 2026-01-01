@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.device_handover import WHOLE_STREAM, DeviceHandoverLog
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
     namespace_digest,
@@ -337,6 +338,11 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
 
 
 class HiCacheController:
+    # Set by a tree cache that logs the device rows its inserts hand over;
+    # writes then wait for the fence stream only as far as their own rows need.
+    # Class-level so controllers built without __init__ keep the whole-stream fence.
+    device_handovers: Optional[DeviceHandoverLog] = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -1030,14 +1036,7 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        if self.write_fence_stream is not None:
-            # The copy may read KV a forward is still writing: under overlap
-            # scheduling a finished request is cached while the next forward
-            # writes its last token, and an evicted SWA page can belong to an
-            # unfinished checkpoint. Later forwards still overlap with the copy.
-            self.l2_transfer_engine.device_to_host_stream.wait_stream(
-                self.write_fence_stream
-            )
+        self._wait_write_fence(op)
 
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
@@ -1058,6 +1057,24 @@ class HiCacheController:
                 num_bytes=self._transfer_num_bytes(op),
             )
         )
+
+    def _wait_write_fence(self, op: CacheOperation) -> None:
+        if self.write_fence_stream is None:
+            return
+        # The copy may read KV a forward is still writing: under overlap
+        # scheduling a finished request is cached while the next forward
+        # writes its last token, and an evicted SWA page can belong to an
+        # unfinished checkpoint. Later forwards still overlap with the copy.
+        copy_stream = self.l2_transfer_engine.device_to_host_stream
+        fence = WHOLE_STREAM
+        if self.device_handovers is not None:
+            fence = self.device_handovers.fence_for(
+                device_indices=op.device_indices, pool_transfers=op.pool_transfers
+            )
+        if fence is WHOLE_STREAM:
+            copy_stream.wait_stream(self.write_fence_stream)
+        elif fence is not None:
+            fence.wait(copy_stream)
 
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
         return len(op.device_indices) * self.mem_pool_host.size_per_token
