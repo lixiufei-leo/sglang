@@ -2328,6 +2328,13 @@ class Envs:
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Kimi-K3.1 prefill indexer: extends of at least this many rows split the logits
+    # and top-k across the attention-TP ranks and all-gather the top-k.
+    # Unset picks the platform default (1024 on CUDA, 64 on ROCm).
+    SGLANG_OPT_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(None)
+    # ROCm prefill indexer logits: aiter FlyDSL fp8_mqa_logits instead of Triton.
+    # Its fp32 sum runs in another order, so top-k ties can resolve differently.
+    SGLANG_USE_FLYDSL_DSA_PREFILL_LOGITS = EnvBool(False)
     # DCP local top-2048 on HIP: split rows longer than one block's registers over several
     # blocks, then merge (exact). Set 0 for the single-block-per-row kernel.
     SGLANG_DSA_DCP_TOPK_CHUNKED = EnvBool(True)
