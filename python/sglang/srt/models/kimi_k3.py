@@ -2190,6 +2190,7 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
+        self._kda_hip_fused_verify_ready = False
         if sp_moe:
             _route_sp_o_proj_output(self.o_proj)
 
@@ -2378,6 +2379,7 @@ class KimiK3DeltaAttention(nn.Module):
                 layer._k3_hip_fused_decode_backend = backend
                 layer._k3_hip_fused_decode_ops = fused_ops
                 self._kda_hip_fused_decode_ready = True
+                self._kda_hip_fused_verify_ready = self._prepare_fused_verify_hip()
             return
         layer = self.attn
         w = layer.conv_weights
@@ -2428,6 +2430,34 @@ class KimiK3DeltaAttention(nn.Module):
             float(self.o_norm.eps),
         )
         self._kda_fused_decode_ready = True
+
+    def _prepare_fused_verify_hip(self) -> bool:
+        """Arm the FlyDSL chain verify over the fused decode's static inputs.
+
+        Builds the kernel for the configured draft-token count here, before CUDA
+        graph capture; other counts build on their first eager verify.
+        """
+        from sglang.srt.layers.attention.linear import kda_verify_flydsl
+
+        layer = self.attn
+        # Only the full-rank gate hands f_a over unprojected; tree verify is not covered.
+        if (
+            not self.use_full_rank_gate
+            or (get_spec().speculative_eagle_topk or 1) > 1
+            or not kda_verify_flydsl.available(self.f_b_proj.weight.device)
+        ):
+            return False
+        num_draft_tokens = get_spec().speculative_num_draft_tokens
+        if num_draft_tokens:
+            kda_verify_flydsl.warmup(
+                static_args=layer._k3_hip_fused_decode_args,
+                conv_weight=layer.conv_weights,
+                dt_bias=layer.dt_bias,
+                lower_bound=float(layer.lower_bound),
+                state_dtype=self.config.mamba2_cache_params.dtype.temporal,
+                num_draft_tokens=num_draft_tokens,
+            )
+        return True
 
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
@@ -2523,8 +2553,9 @@ class KimiK3DeltaAttention(nn.Module):
         # gathered rank-major; the recurrence needs sequence order.
         gathered_rows = hidden_states.shape[0]
         hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
-        defer_f_b = (
-            self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
+        mode = forward_batch.forward_mode
+        defer_f_b = (self._kda_hip_fused_decode_ready and mode.is_decode()) or (
+            self._kda_hip_fused_verify_ready and mode.is_target_verify()
         )
         if self.do_fuse_qkvbfg or self.use_full_rank_gate:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
@@ -2535,7 +2566,8 @@ class KimiK3DeltaAttention(nn.Module):
                 hidden_states
             )
 
-        if not forward_batch.logical_forward_mode.is_decode():
+        # A deferred f_b leaves f_a [tokens, head_dim], which the backend takes as is.
+        if not forward_batch.logical_forward_mode.is_decode() and not defer_f_b:
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)

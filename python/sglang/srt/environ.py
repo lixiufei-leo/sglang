@@ -1793,6 +1793,9 @@ class Envs:
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Kimi-K3 KDA chain verify on gfx950 runs f_b, conv, recurrence and o_norm in one
+    # FlyDSL kernel (ROCm/aiter#7529); set to fall back to the HIP chain.
+    SGLANG_DISABLE_HIP_K3_KDA_FLYDSL_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     # Disable the compact-slot SWA window lookup for compact MLA drafts; off by default.

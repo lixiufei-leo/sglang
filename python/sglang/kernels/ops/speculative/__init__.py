@@ -6,7 +6,12 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
@@ -43,6 +48,22 @@ for _mod, _fn in _TRITON_KERNELS:
             op=f"speculative.{_fn}",
             backend=KernelBackend.TRITON,
             target=f"sglang.kernels.ops.speculative.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
+
+
+# Kimi-K3 ROCm DFlash kernels.
+for _mod, _fn in [
+    ("k3_dflash_post", "verify_argmax"),
+    ("k3_dflash_post", "mamba_track_steps"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"speculative.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.speculative.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
         )
     )
 del _mod, _fn
