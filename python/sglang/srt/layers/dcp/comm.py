@@ -623,6 +623,85 @@ def dcp_push_combine_reduce(
     return pc.dcp_push_combine(n, v, lse, is_lse_base_on_e=is_lse_base_on_e)
 
 
+# The gfx950 LL communicator of the one-kernel DCP merge, or None; resolved once.
+_LL_COMBINE_COMM = None
+_LL_COMBINE_RESOLVED = False
+
+
+def init_dcp_ll_combine(cp_group: "GroupCoordinator") -> None:
+    """Resolve the LL communicator of the one-kernel DCP merge on gfx950 TP8 (see
+    _dcp_ll_combine_reduce). Collective over the TP group on the first call: every
+    rank calls it, outside CUDA-graph capture."""
+    global _LL_COMBINE_COMM, _LL_COMBINE_RESOLVED
+    from sglang.srt.environ import envs
+
+    if _LL_COMBINE_RESOLVED:
+        return
+    _LL_COMBINE_RESOLVED = True
+    # The communicator spans the TP group: the DCP ranks must be the TP ranks.
+    if (
+        not envs.SGLANG_OPT_DCP_LL_COMBINE.get()
+        or cp_group is not get_parallel().tp_group
+    ):
+        return
+    from sglang.srt.layers.communication import k3_ll_comm_hip
+
+    _LL_COMBINE_COMM = k3_ll_comm_hip.get_comm()
+    if _LL_COMBINE_COMM is not None:
+        logger.info("DCP MLA decode merge: one LL push + combine kernel (gfx950 TP8)")
+
+
+# (heads, head_dim, dtype, took the LL kernel) of the partials already logged.
+_LL_COMBINE_ROUTES_LOGGED: set = set()
+
+
+def _log_ll_combine_route(cp_attn_out: torch.Tensor, covered: bool) -> None:
+    """Log once per partial layout whether the merge takes the LL kernel. Runs in
+    eager calls and at graph capture only, never in a graph replay."""
+    route = (cp_attn_out.shape[1], cp_attn_out.shape[2], cp_attn_out.dtype, covered)
+    if route in _LL_COMBINE_ROUTES_LOGGED:
+        return
+    _LL_COMBINE_ROUTES_LOGGED.add(route)
+    logger.info(
+        "DCP MLA decode merge: partials %s %s %s (first of this layout, in graph capture=%s)",
+        list(cp_attn_out.shape),
+        cp_attn_out.dtype,
+        (
+            "take the LL push + combine kernel"
+            if covered
+            else "keep the pack + all-to-all + combine"
+        ),
+        torch.cuda.is_current_stream_capturing(),
+    )
+
+
+def _dcp_ll_combine_reduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool,
+) -> Optional[torch.Tensor]:
+    """The DCP reduce of 128-wide bf16 head partials [B, 96, 128] as one LL push +
+    combine kernel on gfx950 TP8; returns this rank's heads [B, 12, 128], or None
+    when the communicator is not set up or the partials are not the kernel's."""
+    if not _LL_COMBINE_RESOLVED:
+        # A graph captured before the communicator exists keeps the three-step merge.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        init_dcp_ll_combine(cp_group)
+    if _LL_COMBINE_COMM is None:
+        return None
+    from sglang.kernels.ops.attention import dcp_ll_combine_hip as ll
+
+    covered = ll.combine_covered(cp_attn_out, cp_attn_lse)
+    _log_ll_combine_route(cp_attn_out, covered)
+    if not covered:
+        return None
+    return ll.dcp_ll_combine(
+        cp_attn_out, cp_attn_lse, _LL_COMBINE_COMM, is_lse_base_on_e=is_lse_base_on_e
+    )
+
+
 def dcp_a2a_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -643,6 +722,13 @@ def dcp_a2a_lse_reduce(
         return _dcp_fi_a2a_lse_reduce(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
         )
+
+    if _is_hip and comm_backend == "a2a":
+        combined = _dcp_ll_combine_reduce(
+            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+        )
+        if combined is not None:
+            return combined
 
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape

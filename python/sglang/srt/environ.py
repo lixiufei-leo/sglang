@@ -1074,6 +1074,10 @@ class Envs:
     # Kimi-K3 gfx950 TP8 decode: up to this many rows (at most 384) the latent-MoE tail runs on
     # each rank's 1/8 of the up_proj columns and all-gathers the stream.
     SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS = EnvInt(64)
+    # gfx950 TP8 + DCP8 MLA decode: merge the 128-wide head partials in one LL push + LSE
+    # combine kernel (up to 384 rows) in place of the pack + all-to-all + combine. Set 0 for
+    # the three-step merge. See kernels/ops/attention/dcp_ll_combine_hip.py.
+    SGLANG_OPT_DCP_LL_COMBINE = EnvBool(True)
     # Use the gfx950 MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode.
     SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE = EnvBool(True)
     # GiB of ROCm device memory kept out of torch's allocator (0 = no cap): HSA
