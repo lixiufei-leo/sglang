@@ -57,5 +57,9 @@ def apply_kimi_k31_rocm_env_defaults() -> None:
     os.environ.setdefault("SGLANG_K3_RADIX4_TOPK", "1")
     # AgentX target verify (up to 64 requests x 6 rows) takes the column-split tail
     os.environ.setdefault("SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS", "384")
+    # A lossy default: KDA q/k/v/g (every batch, decode included) and the row-sharded
+    # MoE front's [router | latent] rows run in static FP8, 1.3-1.6x faster at prefill
+    # sizes on MI355X. SGLANG_K3_TARGET_DENSE_FP8=off keeps bf16.
+    os.environ.setdefault("SGLANG_K3_TARGET_DENSE_FP8", "wide")
     if "AITER_CONFIG_GEMM_BF16" not in os.environ:
         os.environ["AITER_CONFIG_GEMM_BF16"] = write_k31_bf16_gemm_table()

@@ -25,6 +25,7 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import row_shard
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -50,6 +51,9 @@ _UP_PROJ_COLUMN_SPLIT_MIN_TOKENS = 2048
 _ROW_SHARDED_TAIL_MIN_TOKENS = 4096
 # Crossover vs AITER's A8W4 fused_moe on one MI350X: even at 1K tokens, faster from 2K.
 _A8W4_MOE_MIN_TOKENS = 2048
+# Rows from which the E4M3 [router | latent] GEMM beats the bf16 one on MI355X
+# (4480 x 7168: equal at 128, 1.3x faster from 256).
+_FP8_FRONT_MIN_TOKENS = 256
 
 
 class NextAttnRead(msgspec.Struct, frozen=True):
@@ -122,11 +126,56 @@ class KimiK3MoEHipMixin:
     # Set by link_row_sharded_stream_hip when every later layer reads a stream
     # left on row shards (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM, PP1).
     _row_stream = False
+    # E4M3 copy of the merged front's [router | latent] rows, which shard_front
+    # reads (SGLANG_K3_TARGET_DENSE_FP8); built post-load by _build_routed_front_fp8.
+    _routed_front_fp8: Optional[k3_rocm_dense_fp8.StaticFP8Weight] = None
+
+    def _build_routed_front_fp8(self) -> None:
+        """Post-load: the static FP8 copy of the [router | latent] rows for the
+        row-sharded front's GEMM. The bf16 front stays whole: the merged front
+        (decode, batches under the row-sharded front) and the shared gate_up read it."""
+        self._routed_front_fp8 = None
+        if not (self._row_front_on and k3_rocm_dense_fp8.front_enabled()):
+            return
+        routed_rows = self._front_w[self._front_sizes[0] :]
+        if not k3_rocm_dense_fp8.convertible(routed_rows):
+            return
+        self._routed_front_fp8 = k3_rocm_dense_fp8.StaticFP8Weight(routed_rows)
+        k3_rocm_dense_fp8.log_once(
+            "row-sharded MoE front [router | latent] on a static E4M3 copy from "
+            f"{_FP8_FRONT_MIN_TOKENS} rows"
+        )
+        if self._derived_weight_cache_error is None:
+            self._derived_weight_cache_error = (
+                "Online weight updates are not supported while "
+                "SGLANG_K3_TARGET_DENSE_FP8 keeps a static FP8 copy of the Kimi-K3 "
+                "MoE front's router and routed_expert_down_proj rows: in-place "
+                "weight writes do not requantize it. Restart with "
+                "SGLANG_K3_TARGET_DENSE_FP8=off to allow online updates."
+            )
+
+    def _routed_front_gemm(self, normed: torch.Tensor) -> torch.Tensor:
+        """normed @ [router | latent]^T in fp32: from the static FP8 copy when it
+        takes the batch, else from the bf16 rows."""
+        from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
+
+        fp8 = self._routed_front_fp8
+        if (
+            fp8 is not None
+            and normed.dim() == 2
+            and normed.shape[0] >= _FP8_FRONT_MIN_TOKENS
+            and normed.dtype == torch.bfloat16
+        ):
+            return fp8(normed).float()
+        return _k3_bf16_gemm(
+            normed, self._front_w[self._front_sizes[0] :], out_dtype=torch.float32
+        )
 
     def _prepare_hip_paths(self) -> None:
         """Post-load, after _merge_front_weights: the ROCm paths this layer takes."""
         self._select_prefill_up_proj_columns()
         self._build_row_sharded_front()
+        self._build_routed_front_fp8()
         # fp32 front with a SiTU shared expert: the routed input's bf16 cast can
         # ride the shared activation's launch instead of its own.
         shared = self.shared_experts
@@ -420,7 +469,6 @@ class KimiK3MoEHipMixin:
         input as well (on the side stream under the front GEMM); forward() then
         runs the experts and the tail. False leaves the batch to the regular path."""
         from sglang.kernels.ops.moe.k3_a8w4_gfx950 import quant_mxfp8
-        from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
 
         min_tokens = self._a8w4_moe_min_tokens
         if (
@@ -445,9 +493,7 @@ class KimiK3MoEHipMixin:
                     normed_all, normed.contiguous()
                 ),
             )
-        fused = _k3_bf16_gemm(
-            normed, self._front_w[self._front_sizes[0] :], out_dtype=torch.float32
-        )
+        fused = self._routed_front_gemm(normed)
         router_logits, routed_input = torch.split(fused, self._front_sizes[1:], dim=-1)
         topk_output = self.topk(normed, router_logits)
         top_k = topk_output.topk_ids.shape[1]

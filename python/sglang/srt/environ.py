@@ -1176,6 +1176,11 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Kimi-K3 on ROCm with AITER: static per-tensor FP8 (lossy) for bf16 dense weights.
+    # off | front (an E4M3 copy of the MoE front's [router | latent] rows, for the
+    # row-sharded front's batches of 256+ rows) |
+    # wide (front + KDA q/k/v/g in place, which ends SGLANG_ROCM_K3_FUSE_KDA_INPROJ).
+    SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)

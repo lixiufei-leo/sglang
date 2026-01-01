@@ -2218,6 +2218,8 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
+        if _is_hip:
+            self._convert_qkvg_fp8_hip()
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.
@@ -2254,6 +2256,25 @@ class KimiK3DeltaAttention(nn.Module):
             ):
                 m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
             self._bfa_side_tgv_m_ranges = m_ranges
+
+    def _convert_qkvg_fp8_hip(self) -> None:
+        """ROCm only: the wide [q,k,v,g] projection in static FP8, in place
+        (SGLANG_K3_TARGET_DENSE_FP8=wide). f_a / b stay bf16, so the whole-in-proj
+        merge no longer applies and every batch takes the split projection."""
+        from sglang.srt.layers.quantization import k3_rocm_dense_fp8
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        proj = self.fused_qkvg_proj
+        if (
+            k3_rocm_dense_fp8.qkvg_enabled()
+            # layernorm SP reads the projection's weight itself
+            and not get_parallel().enable_layernorm_sp
+            and isinstance(proj.quant_method, UnquantizedLinearMethod)
+            and proj.bias is None
+            and k3_rocm_dense_fp8.convertible(proj.weight.data)
+        ):
+            k3_rocm_dense_fp8.convert_linear(proj)
+            k3_rocm_dense_fp8.log_once("KDA q/k/v/g in static E4M3, split in-proj")
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
