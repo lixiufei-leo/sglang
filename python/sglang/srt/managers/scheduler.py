@@ -226,6 +226,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.prefill_work_interval import PrefillWorkInterval
 from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -1446,6 +1447,19 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
+        self.prefill_work_interval = PrefillWorkInterval.maybe_build(
+            interval=self.prefill_decode_interval,
+            min_bs=self.prefill_decode_interval_min_bs,
+            chunk_tokens=self.chunked_prefill_size,
+        )
+        if self.prefill_work_interval is not None:
+            logger.info(
+                "Prefill/decode interval follows prefill work: "
+                f"{self.prefill_work_interval.min_rounds} to "
+                f"{self.prefill_decode_interval} decode rounds by the batch's new "
+                "tokens, kept between the chunks of one prompt at running batch >= "
+                f"{self.prefill_work_interval.chunked_min_bs}."
+            )
         self.chunked_reqs = IndexedReqList(ListKind.CHUNKED, abort=self._abort_chunked)
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
@@ -1631,7 +1645,16 @@ class Scheduler(
         # idles the GPU between chunks. DP attention keeps the synchronized
         # cadence because peer ranks may still be decoding.
         nothing_decodes = running_batch.is_empty() or running_batch.is_prefill_only
-        if running_batch.batch_size() < self.prefill_decode_interval_min_bs or (
+        min_bs = self.prefill_decode_interval_min_bs
+        if (
+            self.prefill_work_interval is not None
+            and not self.require_mlp_sync
+            and self.chunked_req is not None
+        ):
+            # The small-batch bypass would run the chunks of one prompt back to
+            # back, stalling decode for its whole prefill.
+            min_bs = self.prefill_work_interval.chunked_min_bs
+        if running_batch.batch_size() < min_bs or (
             nothing_decodes and not self.require_mlp_sync
         ):
             self._prefill_decode_interval_remaining = 0
@@ -1652,8 +1675,15 @@ class Scheduler(
             if self.require_mlp_sync
             else batch.forward_mode.is_extend()
         )
-        if is_extend:
+        if not is_extend:
+            return
+        if self.prefill_work_interval is None or self.require_mlp_sync:
+            # DP ranks must hold the same rounds; their batches differ in tokens.
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
+        else:
+            self._prefill_decode_interval_remaining = (
+                self.prefill_work_interval.rounds_after(batch.extend_num_tokens)
+            )
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
@@ -4572,6 +4602,13 @@ class Scheduler(
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                # The chunked request takes one of the admissible slots itself.
+                max_reqs=self.get_num_allocatable_reqs(
+                    running_bs,
+                    running_batch=running_batch,
+                    num_held_rows=int(self.chunked_req.kv.holds_kv),
+                )
+                - 1,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -4664,6 +4701,16 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             if adder.should_defer(req):
                 break
+            if (
+                self.chunked_req is not None
+                and adder.chunked_req_limit is not None
+                and self.policy.small_prefill_reserve_tokens
+                and not adder.fits_chunk_remainder(req)
+            ):
+                # lpm reserved this pass's remainder for short requests further
+                # down the queue; a second chunked request cannot start anyway.
+                self._revert_unadmitted_mamba(req)
+                continue
             if pp_full_chunk is not None:
                 chunked_prefill_size = self._pp_restore_full_chunk(
                     req, adder, chunked_prefill_size, pp_full_chunk

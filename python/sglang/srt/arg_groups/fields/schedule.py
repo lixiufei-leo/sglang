@@ -63,7 +63,7 @@ class Schedule(msgspec.Struct):
     prefill_decode_interval_min_bs: A[
         Optional[int],
         Arg(
-            help="Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size. By default, this is 0 except for Kimi-K3.1, which derives it from --max-running-requests.",
+            help="Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size. By default, this is 0 except for Kimi-K3.1, which derives it from --max-running-requests. With chunked prefill, a non-zero value also sizes the interval by the prefill batch's new tokens relative to --chunked-prefill-size, and a prompt prefilled in chunks keeps the interval between its chunks from a third of this batch size; SGLANG_ENABLE_PREFILL_WORK_AWARE_ADMISSION=0 restores the fixed interval.",
             resolvable=True,
         ),
     ] = None

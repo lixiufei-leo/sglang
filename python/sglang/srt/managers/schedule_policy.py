@@ -198,6 +198,18 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        # Largest uncached length that gets chunk budget reserved under lpm; 0 is off.
+        self.small_prefill_reserve_tokens = (
+            max(0, envs.SGLANG_PREFILL_CHUNK_RESERVE_TOKENS.get())
+            if self.policy == CacheAwarePolicy.LPM
+            and envs.SGLANG_ENABLE_PREFILL_WORK_AWARE_ADMISSION.get()
+            else 0
+        )
+        if self.small_prefill_reserve_tokens:
+            logger.info(
+                "lpm reserves chunked-prefill budget for waiting requests with at "
+                f"most {self.small_prefill_reserve_tokens} uncached tokens."
+            )
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -421,15 +433,43 @@ class SchedulePolicy:
         )
 
     def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        *,
+        max_reqs: Optional[int] = None,
     ) -> Optional[int]:
-        """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
-        if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
-            or budget < 2 * page_size
-        ):
+        """Cap the active prefill chunk to reserve tokens for shorter waiting requests.
+
+        max_reqs bounds the waiting requests lpm reserves for: the request slots
+        that are free beside the chunked request (None: unbounded).
+        """
+        if budget < 2 * page_size:
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        if self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+            reserved = self._reserve_for_shortest_prefills(
+                waiting_queue, remaining, budget, page_size
+            )
+        elif (
+            self.small_prefill_reserve_tokens
+            and self._determine_active_policy(waiting_queue) == CacheAwarePolicy.LPM
+        ):
+            reserved = self._reserve_for_small_prefills(
+                waiting_queue, remaining, budget, page_size, max_reqs
+            )
+        else:
+            return None
+        if not reserved:
+            return None
+        # Page alignment keeps continuation boundaries allocator-compatible.
+        return (budget - reserved) // page_size * page_size
+
+    def _reserve_for_shortest_prefills(
+        self, waiting_queue: List[Req], remaining: int, budget: int, page_size: int
+    ) -> int:
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
@@ -437,10 +477,34 @@ class SchedulePolicy:
             if work >= remaining or reserved + charge > budget - page_size:
                 break
             reserved += charge
-        if not reserved:
-            return None
-        # Page alignment keeps continuation boundaries allocator-compatible.
-        return (budget - reserved) // page_size * page_size
+        return reserved
+
+    def _reserve_for_small_prefills(
+        self,
+        waiting_queue: List[Req],
+        remaining: int,
+        budget: int,
+        page_size: int,
+        max_reqs: Optional[int],
+    ) -> int:
+        # Arbitrary: the chunked request keeps at least half of every chunk, so
+        # reserving slows its prefill by 2x at most.
+        cap = budget // 2
+        reserved = 0
+        num_reqs = 0
+        # lpm orders by matched prefix, not by work: pass over the long ones.
+        for req in waiting_queue:
+            if max_reqs is not None and num_reqs >= max_reqs:
+                break
+            work = self._shortest_prefill_work(req)
+            if work > self.small_prefill_reserve_tokens or work >= remaining:
+                continue
+            charge = _ceil_div(work, page_size) * page_size
+            if reserved + charge > cap:
+                break
+            reserved += charge
+            num_reqs += 1
+        return reserved
 
     @staticmethod
     def _sort_by_longest_prefix(
@@ -1400,6 +1464,18 @@ class PrefillAdder:
         """whether admission must wait before staging cache transfers for this candidate"""
         return False
 
+    def fits_chunk_remainder(self, req: Req) -> bool:
+        """whether the candidate's whole uncached input fits this pass's chunk remainder"""
+        if self.rem_chunk_tokens is None or self.dllm_config is not None:
+            return True
+        # Same lengths as _select_prefill_admission compares against its chunk limit.
+        prefix_len = req.prefix_len + req.host_hit_length
+        extend_len = len(req.full_untruncated_fill_ids) - prefix_len
+        fit_tokens = (
+            extend_len if self.exact_chunk_fill else self.ceil_paged_tokens(extend_len)
+        )
+        return fit_tokens + self._replay_len(req, prefix_len) <= self.rem_chunk_tokens
+
     def batch_is_full_after_rejection(self, req: Req) -> bool:
         """whether running work must finish before another admission attempt"""
         return bool(self.can_run_list) or not self.running_batch.is_empty()
@@ -1661,10 +1737,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
-            ):
+            if has_chunked_req:
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
