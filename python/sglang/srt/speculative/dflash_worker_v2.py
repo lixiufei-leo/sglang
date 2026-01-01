@@ -823,6 +823,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._aux_pending = False
         if self._aux_overlap:
             logger.info("DFLASH aux graph runs on a side stream beside the draft prep")
+        self._init_tail_graph_state()
 
     def _prepare_megakernel_sampled_accept(self):
         """Megakernel running the sampled accept on the verify vocab shards, or None."""
@@ -2536,6 +2537,40 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_swa_cache_loc=swa_cache_loc,
             )
 
+    # Platform hooks; DFlashWorkerV2ROCm
+    # (hardware_backend/rocm/speculative/dflash_worker_v2_rocm.py) overrides them.
+    def _init_tail_graph_state(self) -> None:
+        pass
+
+    def _replay_tail_graph(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: torch.Tensor,
+        positions: torch.Tensor,
+        commit_lens: torch.Tensor,
+        bs: int,
+    ) -> bool:
+        """Replay the decode draft-KV append from a captured graph. False: not
+        covered, the caller runs _append_target_hidden_decode."""
+        return False
+
+    def _verify_argmax(self, next_token_logits: torch.Tensor) -> torch.Tensor:
+        return torch.argmax(next_token_logits, dim=-1)
+
+    def _mamba_commit_steps(
+        self,
+        *,
+        batch: ScheduleBatch,
+        commit_lens: torch.Tensor,
+        seq_lens_pre_verify: torch.Tensor,
+        seq_lens_post_verify: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """(last accepted step per request, per-request step to track or None
+        to derive it from the track interval)."""
+        return commit_lens.to(torch.int64) - 1, None
+
     def _append_target_hidden_decode(
         self,
         *,
@@ -2879,9 +2914,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             if has_track:
                 mamba_steps_to_track = track_buf[:bs]
         else:
-            last_correct_step_indices = commit_lens.to(torch.int64) - 1
+            last_correct_step_indices, mamba_steps_to_track = self._mamba_commit_steps(
+                batch=batch,
+                commit_lens=commit_lens,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                seq_lens_post_verify=seq_lens_post_verify,
+            )
 
-        if not self._use_commit_metadata and batch.mamba_track_indices is not None:
+        if (
+            not self._use_commit_metadata
+            and batch.mamba_track_indices is not None
+            and mamba_steps_to_track is None
+        ):
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
@@ -3416,7 +3460,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
             if target_predict is None:
-                target_predict = torch.argmax(next_token_logits, dim=-1)
+                target_predict = self._verify_argmax(next_token_logits)
             target_predict = target_predict.view(bs, int(self.block_size))
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if self._use_triton_accept_bonus:
@@ -4299,16 +4343,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if ring_block_locs is not None
                 else self._draft_write_ids(iteration_ids)
             )
-            self._append_target_hidden_decode(
+            swa_cache_loc = self._draft_write_ids(
+                iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            )
+            tail_inputs = dict(
                 target_hidden=hidden.reshape(-1, hidden.shape[-1]),
                 cache_loc=cache_loc,
                 cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
                 positions=positions,
                 commit_lens=commit_lens,
-                swa_cache_loc=self._draft_write_ids(
-                    iteration_ids, IdSpaceKind.SLIDING_WINDOW
-                ),
             )
+            # The tail graph holds no sliding-window locations.
+            if swa_cache_loc is not None or not self._replay_tail_graph(
+                bs=bs, **tail_inputs
+            ):
+                self._append_target_hidden_decode(
+                    **tail_inputs, swa_cache_loc=swa_cache_loc
+                )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None

@@ -7,7 +7,10 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
-from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    supports_mamba_cache_extra_buffer,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
@@ -19,7 +22,14 @@ def handle_mamba_backend(server_args: Any):
     if cfg.mamba_cache_philox_rounds < 0:
         raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
 
-    if cfg.mamba_max_states_per_path == 0 or cfg.mamba_max_states_per_path < -1:
+    if cfg.mamba_max_states_per_path is None:
+        # After the model overrides: Kimi-K3.1 declares its HiCache default there.
+        declare_resolution(
+            server_args,
+            "mamba_max_states_per_path_default",
+            mamba_max_states_per_path=-1,
+        )
+    elif cfg.mamba_max_states_per_path == 0 or cfg.mamba_max_states_per_path < -1:
         raise ValueError(
             "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
             f"integer, got {cfg.mamba_max_states_per_path}."

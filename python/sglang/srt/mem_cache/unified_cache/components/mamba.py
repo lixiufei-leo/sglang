@@ -85,7 +85,9 @@ class MambaComponent(TreeComponent):
         self.mamba_checkpoint_grid = math.lcm(
             slot.checkpoint_interval, params.page_size
         )
-        self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
+        cap = get_exec().mamba.mamba_max_states_per_path
+        # None: args built without resolution, which treats unset as unlimited.
+        self.mamba_max_states_per_path = -1 if cap is None else cap
         from sglang.srt.mem_cache.kv_cache_configurator import (
             host_only_mamba_checkpoint,
         )
