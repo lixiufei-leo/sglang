@@ -45,6 +45,8 @@ class _FencedController(InstantWriteBackController):
     submission n reads."""
 
     start_writing = HybridCacheController.start_writing
+    _wait_write_fence = HybridCacheController._wait_write_fence
+    device_handovers = None
     _l2_transfers = HybridCacheController._l2_transfers
     _num_tokens_by_pool = HybridCacheController._num_tokens_by_pool
 
