@@ -526,6 +526,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             lora_names=params.kv_event_lora_names,
             dynamo_format=params.dynamo_kv_event_format,
         )
+        # The extension is built apart from this package (bundled, or a cached
+        # build under SGLANG_RUST_BUILD_MODE=never), so it can predate the method.
+        self._tracks_mamba_checkpoints = hasattr(self._binding, "note_mamba_checkpoint")
         # The default-root empty result, prebuilt once from the binding.
         self._empty_match_result = self._match_result_from_binding(
             self._binding.empty_match_result()
@@ -908,6 +911,22 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             host_frees[ComponentType(component)].extend(tensors)
         cache_actions.extend(
             self._cache_actions_from_tagged(binding_result.cache_actions)
+        )
+
+    def tracks_mamba_checkpoints(self) -> bool:
+        return self._tracks_mamba_checkpoints
+
+    def note_mamba_checkpoint(
+        self,
+        prev_node_id: NodeId,
+        new_node_id: NodeId,
+        *,
+        supersedes_prev: bool,
+        output_tail: bool,
+        state_inserted: bool,
+    ) -> None:
+        self._binding.note_mamba_checkpoint(
+            prev_node_id, new_node_id, supersedes_prev, output_tail, state_inserted
         )
 
     # ==== HiCache ====

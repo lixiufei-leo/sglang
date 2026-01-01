@@ -93,6 +93,8 @@ class MambaComponent(TreeComponent):
         self.host_only_checkpoint = host_only_mamba_checkpoint()
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+        # Never reset: while False no state is marked and host eviction is plain LRU.
+        self._superseded_marked = False
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         data = node.component_data[self.component_type]
@@ -148,6 +150,7 @@ class MambaComponent(TreeComponent):
             case LRURefreshPhase.WALKDOWN:
                 return
             case LRURefreshPhase.MATCH_END:
+                node.mamba_superseded = False
                 if node.component_data[ct].value is not None:
                     self.tree_core.lru_lists[ct].reset_node_mru(node)
             case LRURefreshPhase.INSERT_END:
@@ -238,6 +241,74 @@ class MambaComponent(TreeComponent):
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False
         return result
+
+    def _holds_state(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[self.component_type]
+        return cd.value is not None or cd.host_value is not None
+
+    def note_checkpoint(
+        self,
+        *,
+        prev: UnifiedTreeNode,
+        new: UnifiedTreeNode,
+        supersedes_prev: bool,
+        output_tail: bool,
+        state_inserted: bool,
+    ) -> None:
+        if not self._holds_state(new):
+            return
+        if not output_tail:
+            new.mamba_output_tail = False
+            new.mamba_superseded = False
+        elif state_inserted:
+            new.mamba_output_tail = True
+            new.mamba_superseded = False
+        if (
+            not supersedes_prev
+            or prev is new
+            or prev is self.tree_core.root_node
+            or not self._holds_state(prev)
+        ):
+            return
+        branches = self._branches_off_path(prev, new)
+        if branches is None:
+            return
+        # The new path is one live continuation of prev's state.
+        live = 1
+        while branches:
+            node = branches.pop()
+            if not self._holds_state(node):
+                branches.extend(node.children.values())
+                continue
+            if node.mamba_output_tail:
+                node.mamba_superseded = True
+            if not node.mamba_superseded:
+                live += 1
+        prev.mamba_superseded = live < 2
+        self._superseded_marked = True
+
+    def _branches_off_path(
+        self, prev: UnifiedTreeNode, new: UnifiedTreeNode
+    ) -> Optional[list[UnifiedTreeNode]]:
+        """Subtree roots hanging off the prev -> new path, down to the first
+        state on it; None when prev is not an ancestor of new."""
+        path = []
+        node = new
+        while node is not None and node is not prev:
+            path.append(node)
+            node = node.parent
+        if node is None:
+            return None
+        branches = []
+        parent = prev
+        for on_path in reversed(path):
+            branches.extend(
+                child for child in parent.children.values() if child is not on_path
+            )
+            if self._holds_state(on_path):
+                break
+            parent = on_path
+        return branches
 
     def _mamba_host_only_checkpoint(self) -> bool:
         return self.host_only_checkpoint
@@ -523,6 +594,10 @@ class MambaComponent(TreeComponent):
         ):
             if not host_lru.in_list(node):
                 host_lru.insert_mru(node)
+
+        if cd.value is None and cd.host_value is None:
+            node.mamba_superseded = False
+            node.mamba_output_tail = False
 
         return freed, host_freed
 
@@ -1212,9 +1287,38 @@ class MambaComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        """Evict mamba host resources.
+        """Evict mamba host resources: superseded states in host-LRU order,
+        then the host LRU.
         Internal nodes: private tombstone (free host mamba only).
         Host leaves: atomic eviction via _evict_host_leaf."""
+        if self._superseded_marked:
+            self._walk_host_eviction(
+                num_tokens,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+                superseded_only=True,
+            )
+        self._walk_host_eviction(
+            num_tokens,
+            tracker,
+            device_frees,
+            host_frees,
+            cache_actions,
+            superseded_only=False,
+        )
+
+    def _walk_host_eviction(
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
+        *,
+        superseded_only: bool,
+    ) -> None:
         ct = self.component_type
         host_lru = self.tree_core.host_lru_lists[ct]
         enabled = self.tree_core.enable_session_radix_cache
@@ -1223,45 +1327,65 @@ class MambaComponent(TreeComponent):
             x = host_lru.cursor_next(host_lock=True)
         else:
             x = host_lru.get_lru_no_host_lock()
-        while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
+        while tracker[ct] < num_tokens and x is not None:
+            if not host_lru.in_list(x):
+                if not superseded_only:
+                    break
+                # An eviction took the saved neighbour with it; rescan the rest.
+                x = host_lru.get_lru_no_host_lock()
+                continue
             if not enabled:
                 x_next = host_lru.get_prev_no_host_lock(x)
-            cd = x.component_data[ct]
-            if x in self.tree_core.evictable_host_leaves and (
-                not enabled or self._can_evict_leaf_atomically(x)
-            ):
-                # Host leaf: atomic eviction (all components host + delete)
-                self.tree_core._evict_host_leaf(
-                    x, tracker, device_frees, host_frees, cache_actions=cache_actions
+            if not superseded_only or x.mamba_superseded:
+                self._evict_host_state(
+                    x, tracker, device_frees, host_frees, cache_actions
                 )
-            else:
-                # Internal (or a leaf a session still pins): tombstone Mamba + cascade
-                assert cd.host_value is not None
-                self.tree_core._evict_component_and_detach_lru(
-                    x,
-                    self,
-                    target=EvictLayer.HOST,
-                    tracker=tracker,
-                    device_frees=device_frees,
-                    host_frees=host_frees,
-                    cache_actions=cache_actions,
-                )
-                self.tree_core._cascade_evict(
-                    x,
-                    self,
-                    tracker,
-                    device_frees=device_frees,
-                    host_frees=host_frees,
-                    target=EvictLayer.HOST,
-                    cache_actions=cache_actions,
-                )
-                self.tree_core._update_evictable_leaf_sets(x)
             if enabled:
                 x = host_lru.cursor_next(host_lock=True)
             else:
                 x = x_next
         if enabled:
             host_lru.cursor_end()
+
+    def _evict_host_state(
+        self,
+        x: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        cd = x.component_data[self.component_type]
+        if x in self.tree_core.evictable_host_leaves and (
+            not self.tree_core.enable_session_radix_cache
+            or self._can_evict_leaf_atomically(x)
+        ):
+            # Host leaf: atomic eviction (all components host + delete)
+            self.tree_core._evict_host_leaf(
+                x, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
+        else:
+            # Internal (or a leaf a session still pins): tombstone Mamba + cascade
+            assert cd.host_value is not None
+            self.tree_core._evict_component_and_detach_lru(
+                x,
+                self,
+                target=EvictLayer.HOST,
+                tracker=tracker,
+                device_frees=device_frees,
+                host_frees=host_frees,
+                cache_actions=cache_actions,
+            )
+            self.tree_core._cascade_evict(
+                x,
+                self,
+                tracker,
+                device_frees=device_frees,
+                host_frees=host_frees,
+                target=EvictLayer.HOST,
+                cache_actions=cache_actions,
+            )
+            self.tree_core._update_evictable_leaf_sets(x)
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._mamba_pool_host is None:

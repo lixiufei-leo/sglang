@@ -637,6 +637,32 @@ class UnifiedTreeCoreInterface(ABC):
         buffers. The caller frees values, then drains actions, even on error."""
         ...
 
+    @abstractmethod
+    def tracks_mamba_checkpoints(self) -> bool:
+        """Whether ``note_mamba_checkpoint`` is implemented; a Rust extension
+        built before it is not, and must not be called."""
+        ...
+
+    @abstractmethod
+    def note_mamba_checkpoint(
+        self,
+        prev_node_id: NodeId,
+        new_node_id: NodeId,
+        *,
+        supersedes_prev: bool,
+        output_tail: bool,
+        state_inserted: bool,
+    ) -> None:
+        """Record that a request holding ``prev_node_id`` checkpointed its Mamba
+        state at ``new_node_id``, for the host pool's superseded-first eviction.
+
+        ``output_tail`` says the checkpoint lies past the request's prompt and
+        ``state_inserted`` that it created the state. With ``supersedes_prev``
+        the state on ``prev_node_id`` is marked superseded unless two live
+        continuations fork from it, and output tails the new path forks away
+        from below it are marked too. No-op if the component is absent."""
+        ...
+
     # ==== HiCache ====
 
     @abstractmethod

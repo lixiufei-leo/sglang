@@ -2720,3 +2720,200 @@ fn release_after_a_restore_and_relock_keeps_the_other_lock() {
     assert_eq!(tc.evictable_size_(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 0);
 }
+
+// A child of `parent` on a one-atom edge, optionally holding a host mamba state
+// that enters the host LRU as most recent.
+fn host_state_child(
+    tc: &mut UnifiedTreeCore<Vec<i64>>,
+    parent: NodeIdx_,
+    atom: i64,
+    state_slot: Option<i64>,
+) -> NodeIdx_ {
+    let node = tc
+        .arena
+        .alloc_child(
+            parent,
+            /* key = */ vec![atom],
+            /* priority = */ 0,
+            /* extra_key = */ None,
+        )
+        .unwrap();
+    if let Some(slot) = state_slot {
+        set_mamba_host(tc, node, slot);
+        tc.host_lru_list_mut(MAMBA).insert_mru(node);
+    }
+    node
+}
+
+fn note_checkpoint(
+    tc: &mut UnifiedTreeCore<Vec<i64>>,
+    prev: NodeIdx_,
+    new: NodeIdx_,
+    supersedes_prev: bool,
+    output_tail: bool,
+) {
+    let (prev_id, new_id) = (tc.arena.node(prev).id, tc.arena.node(new).id);
+    tc.note_mamba_checkpoint(
+        prev_id,
+        new_id,
+        supersedes_prev,
+        output_tail,
+        /* state_inserted = */ true,
+    )
+    .expect("live test nodes");
+}
+
+fn drive_mamba_host_eviction(tc: &mut UnifiedTreeCore<Vec<i64>>, num_tokens: usize) {
+    let mut tracker = HashMap::from([(MAMBA, 0)]);
+    mamba_component().drive_host_eviction(
+        tc,
+        num_tokens,
+        &mut tracker,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut Vec::new(),
+    );
+    assert_eq!(tracker[&MAMBA], num_tokens);
+}
+
+#[test]
+fn prompt_checkpoint_supersedes_the_resumed_state_and_the_bypassed_tail() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.root();
+    let resumed = host_state_child(&mut tc, root, 1, Some(10));
+    // The earlier turn's output hangs below a stateless fork node.
+    let fork = host_state_child(&mut tc, resumed, 2, None);
+    let tail = host_state_child(&mut tc, fork, 3, Some(11));
+    note_checkpoint(
+        &mut tc, resumed, tail, /* supersedes_prev = */ false, /* output_tail = */ true,
+    );
+    assert!(tc.arena.node(tail).mamba_output_tail);
+    assert!(!tc.arena.node(resumed).mamba_superseded);
+    assert!(!tc.mamba_superseded_marked);
+
+    let next = host_state_child(&mut tc, fork, 4, Some(12));
+    note_checkpoint(
+        &mut tc, resumed, next, /* supersedes_prev = */ true, /* output_tail = */ false,
+    );
+    assert!(tc.arena.node(resumed).mamba_superseded);
+    assert!(tc.arena.node(tail).mamba_superseded);
+    assert!(!tc.arena.node(next).mamba_superseded);
+    assert!(tc.mamba_superseded_marked);
+}
+
+#[test]
+fn a_state_two_live_branches_fork_from_is_not_superseded() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.root();
+    let shared = host_state_child(&mut tc, root, 1, Some(10));
+    let first = host_state_child(&mut tc, shared, 2, Some(11));
+    note_checkpoint(
+        &mut tc, shared, first, /* supersedes_prev = */ true, /* output_tail = */ false,
+    );
+    assert!(tc.arena.node(shared).mamba_superseded);
+
+    let second = host_state_child(&mut tc, shared, 3, Some(12));
+    note_checkpoint(
+        &mut tc, shared, second, /* supersedes_prev = */ true, /* output_tail = */ false,
+    );
+    assert!(!tc.arena.node(shared).mamba_superseded);
+    assert!(!tc.arena.node(first).mamba_superseded);
+    assert!(!tc.arena.node(second).mamba_superseded);
+}
+
+#[test]
+fn a_tail_below_another_branchs_prompt_state_is_not_bypassed() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.root();
+    let shared = host_state_child(&mut tc, root, 1, Some(10));
+    let sibling = host_state_child(&mut tc, shared, 2, Some(11));
+    let sibling_tail = host_state_child(&mut tc, sibling, 3, Some(12));
+    note_checkpoint(
+        &mut tc,
+        sibling,
+        sibling_tail,
+        /* supersedes_prev = */ false,
+        /* output_tail = */ true,
+    );
+    let next = host_state_child(&mut tc, shared, 4, Some(13));
+    note_checkpoint(
+        &mut tc, shared, next, /* supersedes_prev = */ true, /* output_tail = */ false,
+    );
+    assert!(!tc.arena.node(sibling_tail).mamba_superseded);
+    assert!(!tc.arena.node(shared).mamba_superseded);
+}
+
+#[test]
+fn checkpoint_from_the_root_or_a_stateless_node_marks_nothing() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.root();
+    let other_tail = host_state_child(&mut tc, root, 1, Some(10));
+    tc.arena.node_mut(other_tail).mamba_output_tail = true;
+    let stateless = host_state_child(&mut tc, root, 2, None);
+    let new = host_state_child(&mut tc, stateless, 3, Some(11));
+    for prev in [root, stateless] {
+        note_checkpoint(
+            &mut tc, prev, new, /* supersedes_prev = */ true, /* output_tail = */ false,
+        );
+    }
+    assert!(!tc.arena.node(other_tail).mamba_superseded);
+    assert!(!tc.mamba_superseded_marked);
+}
+
+#[test]
+fn host_eviction_takes_superseded_states_before_the_lru() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.root();
+    // Host LRU, least recent first: idle, resumed, next.
+    let idle = host_state_child(&mut tc, root, 1, Some(10));
+    let _idle_child = host_state_child(&mut tc, idle, 2, None);
+    let resumed = host_state_child(&mut tc, root, 3, Some(11));
+    let next = host_state_child(&mut tc, resumed, 4, Some(12));
+    let _next_child = host_state_child(&mut tc, next, 5, None);
+    note_checkpoint(
+        &mut tc, resumed, next, /* supersedes_prev = */ true, /* output_tail = */ false,
+    );
+
+    drive_mamba_host_eviction(&mut tc, /* num_tokens = */ 1);
+    assert!(!tc.arena.node(resumed).has_host_value(MAMBA));
+    assert!(!tc.arena.node(resumed).mamba_superseded);
+    assert!(tc.arena.node(idle).has_host_value(MAMBA));
+    assert!(tc.arena.node(next).has_host_value(MAMBA));
+
+    // With no superseded state left the walk is the plain host LRU.
+    drive_mamba_host_eviction(&mut tc, /* num_tokens = */ 1);
+    assert!(!tc.arena.node(idle).has_host_value(MAMBA));
+    assert!(tc.arena.node(next).has_host_value(MAMBA));
+}
+
+#[test]
+fn host_eviction_skips_a_host_locked_superseded_state() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.root();
+    let idle = host_state_child(&mut tc, root, 1, Some(10));
+    let _idle_child = host_state_child(&mut tc, idle, 2, None);
+    let resumed = host_state_child(&mut tc, root, 3, Some(11));
+    let next = host_state_child(&mut tc, resumed, 4, Some(12));
+    note_checkpoint(
+        &mut tc, resumed, next, /* supersedes_prev = */ true, /* output_tail = */ false,
+    );
+    tc.arena.inc_host_lock_ref(resumed, MAMBA);
+
+    drive_mamba_host_eviction(&mut tc, /* num_tokens = */ 1);
+    assert!(tc.arena.node(resumed).has_host_value(MAMBA));
+    assert!(!tc.arena.node(idle).has_host_value(MAMBA));
+}
+
+#[test]
+fn a_match_clears_the_superseded_mark() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.root();
+    let resumed = host_state_child(&mut tc, root, 1, Some(10));
+    let next = host_state_child(&mut tc, resumed, 2, Some(11));
+    note_checkpoint(
+        &mut tc, resumed, next, /* supersedes_prev = */ true, /* output_tail = */ false,
+    );
+    assert!(tc.arena.node(resumed).mamba_superseded);
+    mamba_component().refresh_lru(&mut tc, LRURefreshPhase::MatchEnd, resumed);
+    assert!(!tc.arena.node(resumed).mamba_superseded);
+}

@@ -632,6 +632,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) full_coexisting_host_nodes: NodeSet,
     pub(crate) write_back_coexist_reclaim_digest: i64,
     write_back_queued_count: usize,
+    /// Never cleared short of `reset()`: while false no Mamba state is marked
+    /// superseded and host eviction is plain LRU.
+    pub(crate) mamba_superseded_marked: bool,
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
     /// Per-slot LRU lists, indexed by `ValueSlotIdx::idx`.
@@ -1010,6 +1013,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             full_coexisting_host_nodes: NodeSet::new(),
             write_back_coexist_reclaim_digest: 0,
             write_back_queued_count: 0,
+            mamba_superseded_marked: false,
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
@@ -1054,6 +1058,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.full_coexisting_host_nodes = NodeSet::new();
         self.write_back_coexist_reclaim_digest = 0;
         self.write_back_queued_count = 0;
+        self.mamba_superseded_marked = false;
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
         self.full_evict_device_heap.clear();
@@ -1324,6 +1329,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             &mut result.cache_actions,
         );
         Ok(result)
+    }
+
+    /// See `UnifiedTreeCoreInterface.note_mamba_checkpoint`.
+    pub fn note_mamba_checkpoint(
+        &mut self,
+        prev_node_id: NodeId,
+        new_node_id: NodeId,
+        supersedes_prev: bool,
+        output_tail: bool,
+        state_inserted: bool,
+    ) -> Result<(), NodeAccessError> {
+        let prev_idx = self.arena.resolve(prev_node_id)?;
+        let new_idx = self.arena.resolve(new_node_id)?;
+        let Some(state_slot) = self.slot_of_family(Family::State) else {
+            return Ok(());
+        };
+        self.component_by_type_(state_slot).note_checkpoint(
+            self,
+            prev_idx,
+            new_idx,
+            supersedes_prev,
+            output_tail,
+            state_inserted,
+        );
+        Ok(())
     }
 
     /// Bump the reference count on a node's host-side component locks.

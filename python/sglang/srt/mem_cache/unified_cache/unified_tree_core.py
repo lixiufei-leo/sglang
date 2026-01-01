@@ -147,6 +147,10 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        # Mamba state the host pool evicts ahead of its LRU; cleared by a match.
+        self.mamba_superseded = False
+        # Mamba state checkpointed past its request's prompt (the output region).
+        self.mamba_output_tail = False
         # Queued for its demote by the running write-back eviction walk.
         self.write_back_queued = False
         # Anchor NodeId of an in-flight H->D load-back reading this node's
@@ -2252,6 +2256,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_actions=result.cache_actions,
             )
         return result
+
+    def tracks_mamba_checkpoints(self) -> bool:
+        return True
+
+    def note_mamba_checkpoint(
+        self,
+        prev_node_id: NodeId,
+        new_node_id: NodeId,
+        *,
+        supersedes_prev: bool,
+        output_tail: bool,
+        state_inserted: bool,
+    ) -> None:
+        mamba = self.components_by_type.get(ComponentType.MAMBA)
+        if mamba is None:
+            return
+        mamba.note_checkpoint(
+            prev=self.node_by_id(prev_node_id),
+            new=self.node_by_id(new_node_id),
+            supersedes_prev=supersedes_prev,
+            output_tail=output_tail,
+            state_inserted=state_inserted,
+        )
 
     def evict_excess_path_states(
         self,
