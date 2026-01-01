@@ -564,5 +564,6 @@ POSITIONAL_FIELD_ORDER = (
     "pp_min_chunked_prefill_size",
     "pp_chunk_overhead_tokens",
     "enable_flashmla_prefill_token_packing",
+    "hybrid_cache_checkpoints_level",
 )
 # fmt: on
