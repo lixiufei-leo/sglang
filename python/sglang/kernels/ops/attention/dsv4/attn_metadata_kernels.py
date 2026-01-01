@@ -572,10 +572,12 @@ def _causal_swa_page_indices_kernel(
     seq_lens_ptr,
     swa_replay_start_ptr,
     out_ptr,
+    lengths_ptr,
     rt_stride,
     swa_window,
     padded_width,
     HAS_SWA_REPLAY_START: tl.constexpr,
+    WRITE_LENGTHS: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -587,6 +589,12 @@ def _causal_swa_page_indices_kernel(
         floor = tl.load(swa_replay_start_ptr + row).to(tl.int64)
     else:
         floor = tl.zeros((), dtype=tl.int64)
+    if WRITE_LENGTHS:
+        # valid slots: min(seq_len, window) clipped by the floor, as the stores below
+        length = tl.minimum(
+            tl.minimum(pos + 1, swa_window), tl.maximum(pos - floor + 1, 0)
+        )
+        tl.store(lengths_ptr + row, length.to(tl.int32))
 
     for k0 in range(0, padded_width, BLOCK_K):
         k = k0 + tl.arange(0, BLOCK_K)
@@ -609,7 +617,9 @@ def build_causal_swa_page_indices_triton(
     swa_window: int,
     page_index_aligned_size: int,
     swa_replay_start: Optional[torch.Tensor] = None,
+    lengths_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """lengths_out, when given, receives each row's valid slot count (int32)."""
     num_qo_tokens = seq_lens_casual.size(0)
     padded_width = (
         (swa_window + page_index_aligned_size - 1) // page_index_aligned_size
@@ -629,10 +639,13 @@ def build_causal_swa_page_indices_triton(
         # Unused when HAS_SWA_REPLAY_START is False; any valid pointer will do.
         swa_replay_start if has_swa_replay_start else seq_lens_casual,
         out,
+        # Unused when WRITE_LENGTHS is False; any valid pointer will do.
+        lengths_out if lengths_out is not None else seq_lens_casual,
         req_to_token.stride(0),
         swa_window,
         padded_width,
         HAS_SWA_REPLAY_START=has_swa_replay_start,
+        WRITE_LENGTHS=lengths_out is not None,
         BLOCK_K=BLOCK_K,
     )
     return out
