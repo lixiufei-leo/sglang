@@ -294,6 +294,112 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertEqual(adder.can_run_list, [])
 
+    def create_lpm_chunk_adder(self, *, chunk_tokens=16384):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 1 << 20
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=256,
+            rem_input_tokens=1 << 20,
+            rem_chunk_tokens=chunk_tokens,
+        )
+
+    def create_lpm_policy(self):
+        return SchedulePolicy(
+            policy="lpm",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+    def create_waiting_req(self, rid, *, uncached, matched=0):
+        req = self.create_shared_req(rid)
+        req.origin_input_ids = list(range(matched + uncached))
+        req.full_untruncated_fill_ids = req.origin_input_ids
+        req.num_matched_prefix_tokens = matched
+        req.prefix_len = matched
+        return req
+
+    def test_lpm_reserves_chunk_budget_for_small_waiting_requests(self):
+        adder = self.create_lpm_chunk_adder()
+        policy = self.create_lpm_policy()
+        continuation = self.create_shared_req("continuation")
+        continuation.full_untruncated_fill_ids = list(range(100_000))
+        # lpm order: longest matched prefix first, whatever is left to prefill.
+        mid = self.create_waiting_req("mid", uncached=8000, matched=9000)
+        a = self.create_waiting_req("a", uncached=512, matched=6000)
+        b = self.create_waiting_req("b", uncached=1024, matched=3000)
+        cold = self.create_waiting_req("cold", uncached=50_000)
+        waiting = [mid, a, b, cold]
+        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+            continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+        )
+        self.assertEqual(adder.chunked_req_limit, 16384 - 512 - 1024)
+        self.assertIs(adder.add_chunked_req(continuation), continuation)
+        self.assertEqual(continuation.extend_len, 14848)
+        self.assertEqual(
+            [adder.fits_chunk_remainder(req) for req in waiting],
+            [False, True, True, False],
+        )
+        for req in (a, b):
+            self.assertEqual(
+                adder.add_one_req(
+                    req, has_chunked_req=True, truncation_align_size=None
+                ),
+                AddReqResult.OTHER if req is b else AddReqResult.CONTINUE,
+            )
+        self.assertEqual(adder.can_run_list, [continuation, a, b])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+
+    def test_lpm_reserve_keeps_half_the_chunk_and_counts_free_slots(self):
+        policy = self.create_lpm_policy()
+        continuation = self.create_shared_req("continuation")
+        continuation.full_untruncated_fill_ids = list(range(100_000))
+        waiting = [
+            self.create_waiting_req(i, uncached=4096, matched=1000) for i in range(5)
+        ]
+
+        def limit(queue, **kwargs):
+            return policy.shortest_prefill_chunk_limit(
+                continuation, queue, 16384, 256, **kwargs
+            )
+
+        self.assertEqual(limit(waiting), 8192)
+        self.assertEqual(limit(waiting, max_reqs=1), 12288)
+        self.assertIsNone(limit(waiting, max_reqs=0))
+        self.assertIsNone(limit([self.create_waiting_req("long", uncached=4097)]))
+        # A chunk about to finish leaves its remainder to the queue anyway.
+        continuation.prefix_len = 100_000 - 2048
+        self.assertIsNone(limit(waiting))
+
+    def test_lpm_reserve_follows_the_env_switches(self):
+        continuation = self.create_shared_req("continuation")
+        continuation.full_untruncated_fill_ids = list(range(100_000))
+        waiting = [self.create_waiting_req("a", uncached=1024, matched=1000)]
+        with schedule_policy.envs.SGLANG_PREFILL_CHUNK_RESERVE_TOKENS.override(0):
+            off = self.create_lpm_policy()
+        with schedule_policy.envs.SGLANG_PREFILL_CHUNK_RESERVE_TOKENS.override(512):
+            narrow = self.create_lpm_policy()
+        for policy in (off, narrow):
+            self.assertIsNone(
+                policy.shortest_prefill_chunk_limit(continuation, waiting, 16384, 256)
+            )
+
+    def test_lpm_rejects_second_unfinished_chunk(self):
+        adder = self.create_lpm_chunk_adder(chunk_tokens=512)
+        req = self.create_waiting_req("second-chunk", uncached=1024)
+        self.assertFalse(adder.fits_chunk_remainder(req))
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertIsNone(req.extend_end)
+
     def test_hisparse_short_prompts_reserve_full_buffers_and_scratch(self):
         """Short prompts and chunks must fit persistent buffers plus one scratch."""
         for available, chunk, prefix, ignore_eos, admitted in (

@@ -708,6 +708,13 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Under lpm, a prompt prefilled in chunks leaves part of each chunk to waiting
+    # requests with at most this many uncached tokens; 0 reserves nothing.
+    # 4096 is arbitrary: a quarter of the chunk Kimi-K3.1 is served with.
+    SGLANG_PREFILL_CHUNK_RESERVE_TOKENS = EnvInt(4096)
+    # Hold --prefill-decode-interval longer after a prefill batch above 3/4 of
+    # --chunked-prefill-size, in proportion to its new tokens.
+    SGLANG_ENABLE_PREFILL_DECODE_INTERVAL_SCALING = EnvBool(True)
     # Charge the chunked-prefill compute budget in tokens, not page-ceiled
     # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
     # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
