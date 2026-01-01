@@ -680,12 +680,16 @@ def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
-    if cfg.prefill_decode_interval_min_bs < 0:
+    if (
+        cfg.prefill_decode_interval_min_bs is not None
+        and cfg.prefill_decode_interval_min_bs < 0
+    ):
         raise ValueError("--prefill-decode-interval-min-bs must be non-negative.")
 
 
 def default_unset_prefill_decode_interval(server_args: Any):
-    """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
+    """Leave Qwen3-VL Hopper free to pick 22 and Kimi-K3.1 its min batch size;
+    everyone else stays disabled."""
     from sglang.srt.arg_groups.overrides import declare_resolution
 
     cfg = resolving_view(server_args)
@@ -694,6 +698,12 @@ def default_unset_prefill_decode_interval(server_args: Any):
             server_args,
             "prefill_decode_interval_default",
             prefill_decode_interval=0,
+        )
+    if cfg.prefill_decode_interval_min_bs is None:
+        declare_resolution(
+            server_args,
+            "prefill_decode_interval_min_bs_default",
+            prefill_decode_interval_min_bs=0,
         )
 
 

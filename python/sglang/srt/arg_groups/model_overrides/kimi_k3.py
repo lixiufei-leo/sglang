@@ -2,6 +2,7 @@
 
 import inspect
 import logging
+import math
 from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -184,7 +185,33 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.enable_unified_memory:
         raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
     overrides.update(_kimi_k31_lossless_defaults(cfg))
+    overrides.update(_kimi_k31_prefill_decode_interval_min_bs_default(cfg))
     return overrides
+
+
+def _kimi_k31_prefill_decode_interval_min_bs_default(cfg: Any) -> dict:
+    """Hold prefill for --prefill-decode-interval only once the decode batch is
+    nearly full; below that, admit queued requests every round so the batch
+    fills. Needs an explicit --max-running-requests to know where full is."""
+    if (
+        cfg.prefill_decode_interval_min_bs is not None
+        or not cfg.prefill_decode_interval
+        or cfg.max_running_requests is None
+        # DP attention compares each rank's own batch against the min, and
+        # the per-rank cap is not resolved yet.
+        or cfg.enable_dp_attention
+        or cfg.dp_size > 1
+        or cfg.attn_dp_size > 1
+    ):
+        return {}
+    # 90% of the cap: a closed-loop AgentX c32 sweep (cap 20) gained nothing
+    # past 18, so the interval still guards a nearly full batch.
+    min_bs = max(1, math.ceil(0.9 * cfg.max_running_requests))
+    logger.info(
+        f"Kimi-K3.1 applies --prefill-decode-interval only at running batch >= "
+        f"{min_bs} (prefill_decode_interval_min_bs)."
+    )
+    return {"prefill_decode_interval_min_bs": min_bs}
 
 
 def _kimi_k31_lossless_defaults(cfg: Any) -> dict:
