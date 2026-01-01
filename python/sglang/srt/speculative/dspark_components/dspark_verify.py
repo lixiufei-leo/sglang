@@ -6,6 +6,7 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.accept_outs import write_accept_outs_triton
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
@@ -871,6 +872,18 @@ def build_accept_outs(
     tp_sync.sync(sync_site, bonus)
     tp_sync.sync(sync_site, cap_trim_lens)
 
+    if out is not None and correct_len.is_cuda and not _is_npu:
+        write_accept_outs_triton(
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=cap_trim_lens,
+            prefix_lens=prefix_lens,
+            draft_tokens=draft_tokens,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            out=out,
+        )
+        return out
     finalized = FinalizeAcceptLens.execute(
         correct_len=correct_len,
         cap_trim_lens=cap_trim_lens,

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.draft_params import fill_draft_params
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
@@ -153,6 +154,18 @@ def resolve_draft_params(
         temperatures.fill_(1.0)
         greedy_mask.fill_(True)
         step_temperatures.zero_()
+    elif (
+        sampling_info.temperatures.is_cuda
+        and sampling_info.top_ks.is_cuda
+        and temperatures.is_cuda
+    ):
+        fill_draft_params(
+            temperatures=sampling_info.temperatures.view(-1),
+            top_ks=sampling_info.top_ks.view(-1),
+            temperatures_out=temperatures,
+            greedy_out=greedy_mask,
+            step_out=step_temperatures,
+        )
     else:
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
@@ -195,8 +208,10 @@ def _draft_step(
     noise: DraftNoise,
     step: int,
     logits_out: Optional[torch.Tensor],
+    tokens_out: Optional[torch.Tensor] = None,
+    advance_offset: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if logits_out is None and len(prev_tokens) == 1:
+    if logits_out is None and len(prev_tokens) == 1 and not advance_offset:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
         w2_weight = markov_head.greedy_w2_weight()
         # The kernel reads one w2 row per base-logit column.
@@ -206,6 +221,8 @@ def _draft_step(
                 prev_embeds=markov_head.get_prev_embeddings(prev_tokens),
                 w2_weight=w2_weight,
             )
+            if tokens_out is not None:
+                tokens = tokens_out.copy_(tokens)
             return tokens, state
     bias, state = markov_head.step_bias(
         prev_tokens, hidden_states=hidden_states, state=state
@@ -231,6 +248,8 @@ def _draft_step(
         logits_out=logits_out,
         # Rows sample at their temperatures only when the step logits are kept.
         has_sampled_rows=None if logits_out is not None else False,
+        out=tokens_out,
+        advance_offset=advance_offset,
         **sharded,
     )
     return tokens, state
@@ -247,9 +266,11 @@ def draft_markov_block(
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
+    tokens_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
-    written to ``logits_out`` or allocated here; a greedy draft keeps none."""
+    """Returns the drafted [bs, gamma] tokens, written to ``tokens_out`` when
+    given, and the [bs, gamma, vocab] step logits, written to ``logits_out`` or
+    allocated here; a greedy draft keeps none."""
     bs, gamma = base_logits.shape[:2]
     if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
@@ -257,6 +278,17 @@ def draft_markov_block(
             dtype=markov_head.step_logits_dtype(base_logits.dtype),
             device=base_logits.device,
         )
+    # A sampling step's finish launch writes its tokens into tokens_out's column,
+    # or into a contiguous row when the per-step broadcast reads them.
+    step_outs = staged = None
+    if tokens_out is not None and not greedy_draft:
+        if tp_sync.enabled(SpecTpSyncSite.DSPARK_DRAFT):
+            staged = torch.empty(
+                (gamma, bs), dtype=torch.int64, device=tokens_out.device
+            )
+            step_outs = list(staged)
+        else:
+            step_outs = list(tokens_out.unbind(1))
     state = markov_head.init_state(draft_hidden)
     prev_tokens = anchor_tokens.long()
     draft_tokens = []
@@ -271,13 +303,23 @@ def draft_markov_block(
             noise=noise,
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
+            tokens_out=None if step_outs is None else step_outs[step],
+            # The last step's finish launch advances the noise counter.
+            advance_offset=not greedy_draft and step == gamma - 1,
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
-    if greedy_draft:
-        return torch.stack(draft_tokens, dim=1), None
-    noise.offset.add_(1)
-    return torch.stack(draft_tokens, dim=1), logits_out
+    if step_outs is None:
+        stacked = torch.stack(draft_tokens, dim=1)
+        if tokens_out is None:
+            tokens_out = stacked
+        else:
+            tokens_out.copy_(stacked)
+    elif staged is not None:
+        tokens_out.copy_(staged.t())
+    if gamma == 0 and not greedy_draft:
+        noise.offset.add_(1)
+    return tokens_out, None if greedy_draft else logits_out
 
 
 def sample_draft_block(

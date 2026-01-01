@@ -663,6 +663,59 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                 self.assertTrue(torch.equal(got, expected))
                 self.assertTrue(torch.equal(cache_q, cache))
 
+    def test_strided_kv_rows(self):
+        """The DSpark draft KV commit hands this launch the split columns of a
+        stacked projection (allow_strided_output on HIP): every cache byte and the
+        roped q must equal a launch from contiguous copies."""
+        dev = "cuda"
+        num_tokens, heads, stages = 300, 4, 3
+        torch.manual_seed(5)
+        kv_all = torch.randn(
+            num_tokens, stages * HEAD_DIM, device=dev, dtype=torch.bfloat16
+        )
+        weight = (1 + 0.1 * torch.randn(HEAD_DIM, device=dev)).to(torch.bfloat16)
+        angles = torch.rand(8192, ROPE_DIM // 2, device=dev) * 2 * math.pi
+        freqs_cis = torch.polar(torch.ones_like(angles), angles)
+        positions = torch.randint(0, 8192, (num_tokens,), device=dev)
+        out_loc = torch.randperm(FULL_SIZE, device=dev)[:num_tokens].to(torch.int32)
+        out_loc[3] = -1
+        q = (torch.randn(num_tokens, heads, HEAD_DIM, device=dev) * 3).to(
+            torch.bfloat16
+        )
+        for layout in (KVLayout.V4, KVLayout.V41):
+            for with_q in (False, True):
+                with self.subTest(layout=layout, with_q=with_q):
+                    page_bytes = layout.page_bytes(PAGE_SIZE)
+                    caches, qs = [], []
+                    for contiguous in (False, True):
+                        cache = torch.zeros(
+                            FULL_SIZE // PAGE_SIZE,
+                            page_bytes,
+                            device=dev,
+                            dtype=torch.uint8,
+                        )
+                        q_run = q.clone() if with_q else None
+                        for kv in kv_all.split(HEAD_DIM, dim=-1):
+                            self.assertFalse(kv.is_contiguous())
+                            fused_k_norm_rope_flashmla(
+                                kv.contiguous() if contiguous else kv,
+                                weight,
+                                1e-6,
+                                freqs_cis,
+                                positions,
+                                out_loc,
+                                cache,
+                                PAGE_SIZE,
+                                q=q_run,
+                                layout=layout,
+                            )
+                        caches.append(cache)
+                        qs.append(q_run)
+                    self.assertTrue(torch.equal(caches[0], caches[1]))
+                    self.assertGreater(int(caches[1].count_nonzero()), 0)
+                    if with_q:
+                        self.assertTrue(torch.equal(qs[0], qs[1]))
+
 
 if __name__ == "__main__":
     unittest.main()
