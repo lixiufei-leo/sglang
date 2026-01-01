@@ -78,6 +78,12 @@ class RadixLinearAttention(nn.Module):
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
+        # Kimi-K3 fused KDA handoff, set by the model per forward or at load:
+        # f_a is passed instead of the f_b gate, and the o_norm gate is offered.
+        self._k3_deferred_f_b = False
+        self._k3_onorm_gate: Optional[torch.Tensor] = None
+        self._k3_onorm_consumed = False
+        self._k3_hip_fused_decode_args: Optional[tuple] = None
 
     def refresh_conv_weights(self, weight: torch.Tensor) -> None:
         """Rebuild the cached convolution view after replacing its parameter."""

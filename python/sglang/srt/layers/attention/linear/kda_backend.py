@@ -10,6 +10,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear import kda_verify_flydsl
 from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillGraphMetadata,
     KDAPrefillTrackRows,
@@ -1099,7 +1100,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.query_start_loc.shape[0] - 1
                 ) * forward_batch.spec_info.draft_token_num
                 mixed_qkv = mixed_qkv[:logical_num_tokens]
-                a = a[:, :logical_num_tokens]
+                # A deferred f_b leaves f_a as [tokens, K], not [1, tokens, H, K].
+                if layer._k3_deferred_f_b:
+                    a = a[:logical_num_tokens]
+                else:
+                    a = a[:, :logical_num_tokens]
                 b = b[:, :logical_num_tokens]
             core_attn_out = self._forward_target_verify(
                 layer, forward_batch, mixed_qkv, a, b
@@ -1352,6 +1357,33 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.ragged_verify_layout
+        if layer._k3_deferred_f_b:
+            core_attn_out = None
+            if (
+                ragged_layout is None
+                and not replayssm_on
+                and retrieve_next_token is None
+                and retrieve_next_sibling is None
+                and retrieve_parent_token is None
+                and self.accept_lens_pool is None
+            ):
+                core_attn_out = kda_verify_flydsl.run_layer(
+                    layer=layer,
+                    mixed_qkv=mixed_qkv,
+                    f_a=a,
+                    raw_beta=b,
+                    conv_states=conv_states,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    intermediate_state_indices=intermediate_state_indices,
+                    intermediate_state_cache=intermediate_state_cache,
+                    intermediate_conv_window_cache=intermediate_conv_window_cache,
+                    num_draft_tokens=draft_token_num,
+                )
+            if core_attn_out is not None:
+                layer._k3_onorm_consumed = True
+                return core_attn_out
+            a = kda_verify_flydsl.materialize_f_b(layer=layer, f_a=a)
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
