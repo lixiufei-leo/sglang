@@ -144,10 +144,13 @@ def _select_block(
 def _markov_sample_finish_kernel(
     P,
     OUT,
+    OUT_STRIDE,
+    OFFSET,
     BS,
     PARTS: tl.constexpr,
     WORLD: tl.constexpr,
     BLOCK: tl.constexpr,
+    ADVANCE: tl.constexpr,
 ):
     row = tl.program_id(0)
     i = tl.arange(0, BLOCK)
@@ -165,7 +168,11 @@ def _markov_sample_finish_kernel(
     maximum = tl.max(tl.where(valid & ~nan, value, -float("inf")), 0)
     wins = tl.where(has_nan, nan, valid & (value == maximum))
     result = tl.min(tl.where(wins, idx, _NO_INDEX), 0)
-    tl.store(OUT + row, result.to(tl.int64))
+    tl.store(OUT + row * OUT_STRIDE, result.to(tl.int64))
+    if ADVANCE:
+        # Every partial launch that reads the noise counter ran before this one.
+        if row == 0:
+            tl.store(OFFSET, tl.load(OFFSET) + 1)
 
 
 def _mul32(a: torch.Tensor, b: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -244,7 +251,9 @@ class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
     the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole.
-    ``has_sampled_rows=False`` argmaxes every row."""
+    ``has_sampled_rows=False`` argmaxes every row. ``out`` (``[rows]`` int64,
+    any stride) receives the tokens; ``advance_offset`` adds 1 to ``offset``
+    after the step has read it."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
@@ -298,6 +307,8 @@ class MarkovSampleStep:
         gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
+        out: Optional[torch.Tensor] = None,
+        advance_offset: bool = False,
     ) -> torch.Tensor:
         cls._check(
             base_logits,
@@ -338,16 +349,25 @@ class MarkovSampleStep:
             gathered = partial if gather is None else gather(partial)
         parts = gathered.shape[1] // 2
         world = gathered.shape[0] // rows
-        result = torch.empty(rows, device=base_logits.device, dtype=torch.int64)
+        if out is None:
+            result = torch.empty(rows, device=base_logits.device, dtype=torch.int64)
+        else:
+            assert out.shape == (rows,) and out.dtype == torch.int64
+            result = out
         _markov_sample_finish_kernel[(rows,)](
             gathered,
             result,
+            result.stride(0),
+            offset,
             rows,
             parts,
             world,
             triton.next_power_of_2(parts * world),
+            advance_offset and rows > 0,
             num_warps=4,
         )
+        if advance_offset and rows == 0:
+            offset.add_(1)
         return result
 
     @classmethod
@@ -366,6 +386,8 @@ class MarkovSampleStep:
         gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
+        out: Optional[torch.Tensor] = None,
+        advance_offset: bool = False,
     ) -> torch.Tensor:
         # None draws the noise for every row: reading the temperatures on the
         # host would break a graph capture.
@@ -396,6 +418,8 @@ class MarkovSampleStep:
                 step_dtype=step_dtype,
                 logits_out=logits_out,
                 has_sampled_rows=has_sampled_rows,
+                out=out,
+                advance_offset=advance_offset,
             )
         padded = base_logits.shape[1]
         device = base_logits.device
@@ -449,4 +473,10 @@ class MarkovSampleStep:
         finite = torch.where(valid & ~nan, values, -torch.inf)
         maximum = finite.amax(dim=-1, keepdim=True)
         wins = torch.where(has_nan, nan, valid & (finite == maximum))
-        return torch.where(wins, indices, _NO_INDEX.value).amin(dim=-1)
+        result = torch.where(wins, indices, _NO_INDEX.value).amin(dim=-1)
+        if advance_offset:
+            offset.add_(1)
+        if out is None:
+            return result
+        assert out.shape == (rows,) and out.dtype == torch.int64
+        return out.copy_(result)

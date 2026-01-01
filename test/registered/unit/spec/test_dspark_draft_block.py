@@ -187,7 +187,10 @@ class TestMegakernelDraftSampler(CustomTestCase):
         tokens = torch.full((BS, GAMMA), 7)
         with (
             patch.object(
-                ds, "draft_markov_block", return_value=(tokens, None)
+                ds,
+                "draft_markov_block",
+                # The block writes the sampler's static token buffer itself.
+                side_effect=lambda **kw: (kw["tokens_out"].copy_(tokens), None),
             ) as stock,
             patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
         ):

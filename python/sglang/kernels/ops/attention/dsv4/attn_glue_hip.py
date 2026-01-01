@@ -150,6 +150,102 @@ def expand_index_page_table(
 
 
 @triton.jit
+def _low_ratio_prefill_indexer_kernel(
+    pt_ptr,
+    seq_lens_ptr,
+    out_a_ptr,
+    lens_a_ptr,
+    out_b_ptr,
+    lens_b_ptr,
+    n_pages,
+    pt_stride,
+    RATIO_A: tl.constexpr,
+    BPP_A: tl.constexpr,
+    RATIO_B: tl.constexpr,
+    BPP_B: tl.constexpr,
+    HAS_B: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    blk = tl.program_id(1)
+    p = blk * BLOCK + tl.arange(0, BLOCK)
+    m = p < n_pages
+    page = tl.load(pt_ptr + row * pt_stride + p, mask=m, other=0).to(tl.int64)
+    if BPP_A > 1:
+        k = tl.arange(0, BPP_A)
+        tl.store(
+            out_a_ptr + row * (n_pages * BPP_A) + p[:, None] * BPP_A + k[None, :],
+            (page[:, None] * BPP_A + k[None, :]).to(tl.int32),
+            mask=m[:, None],
+        )
+    if HAS_B and BPP_B > 1:
+        k = tl.arange(0, BPP_B)
+        tl.store(
+            out_b_ptr + row * (n_pages * BPP_B) + p[:, None] * BPP_B + k[None, :],
+            (page[:, None] * BPP_B + k[None, :]).to(tl.int32),
+            mask=m[:, None],
+        )
+    if blk == 0:
+        s = tl.load(seq_lens_ptr + row).to(tl.int64)
+        # torch's floor division; Triton's // rounds toward zero
+        qa = s // RATIO_A
+        qa = tl.where((s < 0) & (s % RATIO_A != 0), qa - 1, qa)
+        tl.store(lens_a_ptr + row, qa.to(tl.int32))
+        if HAS_B:
+            qb = s // RATIO_B
+            qb = tl.where((s < 0) & (s % RATIO_B != 0), qb - 1, qb)
+            tl.store(lens_b_ptr + row, qb.to(tl.int32))
+
+
+def low_ratio_prefill_indexer_tables(
+    page_table: torch.Tensor,
+    seq_lens_casual: torch.Tensor,
+    blocks_per_page_by_ratio: Dict[int, int],
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    """Per ratio (at most two): (expand_index_page_table(page_table, bpp),
+    (seq_lens_casual // ratio).to(int32)) in one launch."""
+    ratios = list(blocks_per_page_by_ratio)
+    assert 1 <= len(ratios) <= 2, ratios
+    assert page_table.dim() == 2 and page_table.stride(1) == 1
+    assert seq_lens_casual.dim() == 1 and seq_lens_casual.is_contiguous()
+    bs, n = page_table.shape
+    assert seq_lens_casual.shape[0] == bs, (seq_lens_casual.shape, page_table.shape)
+    assert bs > 0 and n > 0
+    out = {}
+    for ratio in ratios:
+        bpp = blocks_per_page_by_ratio[ratio]
+        assert bpp >= 1 and bpp & (bpp - 1) == 0, bpp
+        table = (
+            page_table
+            if bpp == 1
+            else torch.empty((bs, n * bpp), dtype=torch.int32, device=page_table.device)
+        )
+        lens = torch.empty((bs,), dtype=torch.int32, device=page_table.device)
+        out[ratio] = (table, lens)
+    ra = ratios[0]
+    rb = ratios[1] if len(ratios) == 2 else ra
+    block = 256
+    _low_ratio_prefill_indexer_kernel[(bs, triton.cdiv(n, block))](
+        page_table,
+        seq_lens_casual,
+        out[ra][0],
+        out[ra][1],
+        out[rb][0],
+        out[rb][1],
+        n,
+        page_table.stride(0),
+        RATIO_A=ra,
+        BPP_A=blocks_per_page_by_ratio[ra],
+        RATIO_B=rb,
+        BPP_B=blocks_per_page_by_ratio[rb],
+        HAS_B=len(ratios) == 2,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
 def _low_ratio_compression_metadata_kernel(
     seq_lens_ptr,
     raw_out_loc_ptr,

@@ -123,6 +123,50 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             prev = (base[:, step].float() + bias).argmax(-1)
             self.assertEqual(eager_tokens[0, step].item(), prev.item())
 
+    def test_tokens_out_matches_the_stacked_block(self):
+        # The finish launches write tokens_out (its columns, or staged rows when
+        # the per-step broadcast is on) and advance the noise counter once.
+        torch.manual_seed(2)
+        head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(DEVICE)
+        head = head.to(torch.bfloat16)
+        base = torch.randn(BS, GAMMA, VOCAB, device=DEVICE).to(torch.bfloat16)
+        anchor = torch.randint(0, VOCAB, (BS,), device=DEVICE)
+        temperatures = torch.rand(BS, device=DEVICE) + 0.3
+        temperatures[::2] = 0.0
+
+        def block(tokens_out, broadcast):
+            noise = DraftNoise(
+                key=11, offset=torch.full((1,), 4, dtype=torch.int64, device=DEVICE)
+            )
+            tokens, logits = draft_markov_block(
+                markov_head=head,
+                base_logits=base,
+                anchor_tokens=anchor,
+                draft_hidden=None,
+                step_temperatures=temperatures,
+                noise=noise,
+                tp_sync=SimpleNamespace(
+                    sync=lambda site, value: value, enabled=lambda site: broadcast
+                ),
+                logits_out=torch.empty(
+                    BS, GAMMA, VOCAB, dtype=torch.bfloat16, device=DEVICE
+                ),
+                tokens_out=tokens_out,
+            )
+            return tokens, logits, noise.offset.item()
+
+        want_tokens, want_logits, want_offset = block(None, False)
+        self.assertEqual(want_offset, 5)
+        for broadcast in (False, True):
+            out = torch.full((2 * BS * GAMMA,), -1, dtype=torch.int64, device=DEVICE)
+            tokens_out = out[: BS * GAMMA].view(BS, GAMMA)
+            tokens, logits, offset = block(tokens_out, broadcast)
+            self.assertIs(tokens, tokens_out)
+            self.assertTrue(torch.equal(tokens, want_tokens))
+            self.assertTrue(torch.equal(logits, want_logits))
+            self.assertEqual(offset, want_offset)
+            self.assertTrue(out[BS * GAMMA :].eq(-1).all())
+
     def test_captured_sampler_matches_eager_block(self):
         # The real tail (staging, static buffers, [:bs] views) against eager.
         torch.manual_seed(1)
@@ -141,7 +185,9 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         model.compute_confidence = MethodType(
             DSparkDraftMixin.compute_confidence, model
         )
-        tp_sync = SimpleNamespace(sync=lambda site, value: value)
+        tp_sync = SimpleNamespace(
+            sync=lambda site, value: value, enabled=lambda site: False
+        )
         noise = DraftNoise(
             key=5, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
         )

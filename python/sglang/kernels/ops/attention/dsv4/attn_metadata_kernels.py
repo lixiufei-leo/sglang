@@ -572,10 +572,19 @@ def _causal_swa_page_indices_kernel(
     seq_lens_ptr,
     swa_replay_start_ptr,
     out_ptr,
+    lengths_ptr,
+    pt_r2t_ptr,
+    pt_out_ptr,
     rt_stride,
     swa_window,
     padded_width,
+    pt_r2t_stride,
+    pt_num_cols,
     HAS_SWA_REPLAY_START: tl.constexpr,
+    WRITE_LENGTHS: tl.constexpr,
+    WRITE_PAGE_TABLE: tl.constexpr,
+    PAGE: tl.constexpr,
+    PT_BLOCK: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -587,6 +596,23 @@ def _causal_swa_page_indices_kernel(
         floor = tl.load(swa_replay_start_ptr + row).to(tl.int64)
     else:
         floor = tl.zeros((), dtype=tl.int64)
+    if WRITE_LENGTHS:
+        # valid slots: min(seq_len, window) clipped by the floor, as the stores below
+        length = tl.minimum(
+            tl.minimum(pos + 1, swa_window), tl.maximum(pos - floor + 1, 0)
+        )
+        tl.store(lengths_ptr + row, length.to(tl.int32))
+    if WRITE_PAGE_TABLE:
+        # page_table_from_req_to_token's row: r2t[rp, ::PAGE] // PAGE (floor), int32
+        pt_base = pt_r2t_ptr + rp * pt_r2t_stride
+        pt_out = pt_out_ptr + row.to(tl.int64) * pt_num_cols
+        for c0 in range(0, pt_num_cols, PT_BLOCK):
+            col = c0 + tl.arange(0, PT_BLOCK)
+            cmask = col < pt_num_cols
+            v = tl.load(pt_base + col.to(tl.int64) * PAGE, mask=cmask, other=0)
+            q = v // PAGE
+            q = tl.where((v < 0) & (v % PAGE != 0), q - 1, q)
+            tl.store(pt_out + col, q.to(tl.int32), mask=cmask)
 
     for k0 in range(0, padded_width, BLOCK_K):
         k = k0 + tl.arange(0, BLOCK_K)
@@ -609,7 +635,13 @@ def build_causal_swa_page_indices_triton(
     swa_window: int,
     page_index_aligned_size: int,
     swa_replay_start: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    lengths_out: Optional[torch.Tensor] = None,
+    page_table_spec: Optional[tuple[torch.Tensor, int, int]] = None,
+):
+    """lengths_out, when given, receives each row's valid slot count (int32).
+    page_table_spec = (req_to_token, max_seq_len, page_size), when given, also
+    builds page_table_from_req_to_token(req_to_token, req_pool_indices_repeated,
+    max_seq_len, page_size) in the same launch and returns (indices, page_table)."""
     num_qo_tokens = seq_lens_casual.size(0)
     padded_width = (
         (swa_window + page_index_aligned_size - 1) // page_index_aligned_size
@@ -621,6 +653,18 @@ def build_causal_swa_page_indices_triton(
     )
     BLOCK_K = 256
     has_swa_replay_start = swa_replay_start is not None
+    page_table = None
+    pt_r2t, pt_stride, pt_cols, page, pt_block = seq_lens_casual, 0, 0, 1, 1
+    if page_table_spec is not None:
+        pt_r2t, max_seq_len, page = page_table_spec
+        assert pt_r2t.dim() == 2 and pt_r2t.stride(1) == 1
+        assert req_pool_indices_repeated.dim() == 1
+        pt_stride = pt_r2t.stride(0)
+        pt_cols = max(0, (min(max_seq_len, pt_r2t.shape[1]) + page - 1) // page)
+        pt_block = min(1024, triton.next_power_of_2(max(pt_cols, 1)))
+        page_table = torch.empty(
+            (num_qo_tokens, pt_cols), dtype=torch.int32, device=seq_lens_casual.device
+        )
     _causal_swa_page_indices_kernel[(num_qo_tokens,)](
         req_to_token,
         full_to_swa_mapping,
@@ -629,12 +673,25 @@ def build_causal_swa_page_indices_triton(
         # Unused when HAS_SWA_REPLAY_START is False; any valid pointer will do.
         swa_replay_start if has_swa_replay_start else seq_lens_casual,
         out,
+        # Unused when WRITE_LENGTHS is False; any valid pointer will do.
+        lengths_out if lengths_out is not None else seq_lens_casual,
+        # Unused when WRITE_PAGE_TABLE is False; any valid pointer will do.
+        pt_r2t,
+        page_table if page_table is not None else seq_lens_casual,
         req_to_token.stride(0),
         swa_window,
         padded_width,
+        pt_stride,
+        pt_cols,
         HAS_SWA_REPLAY_START=has_swa_replay_start,
+        WRITE_LENGTHS=lengths_out is not None,
+        WRITE_PAGE_TABLE=page_table is not None,
+        PAGE=page,
+        PT_BLOCK=pt_block,
         BLOCK_K=BLOCK_K,
     )
+    if page_table_spec is not None:
+        return out, page_table
     return out
 
 

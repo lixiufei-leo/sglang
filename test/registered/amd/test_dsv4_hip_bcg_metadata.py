@@ -488,6 +488,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         backend.has_c4 = True
         backend.has_c128 = True
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.enable_decoder_swa_bounded_replay = False
         backend._build_forward_metadata = mock.Mock(return_value=capture_metadata)
         backend.init_forward_metadata_in_graph = mock.Mock()
         backend._refresh_fp4_prefill_workspace = mock.Mock()
@@ -617,6 +618,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         backend.has_c4 = True
         backend.has_c128 = True
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.enable_decoder_swa_bounded_replay = False
         backend._build_forward_metadata = mock.Mock(return_value=replay_metadata)
         backend.init_forward_metadata_in_graph = mock.Mock()
         backend._refresh_fp4_prefill_workspace = mock.Mock()

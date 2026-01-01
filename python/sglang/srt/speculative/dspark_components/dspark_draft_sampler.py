@@ -173,8 +173,8 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            tokens_out=self.out[: bs * self.gamma].view(bs, self.gamma),
         )
-        self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         return draft_tokens, confidence_features
 
 

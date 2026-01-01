@@ -15,6 +15,8 @@ import torch
 from sglang.kernels.ops.attention.dsv4 import attn_metadata_kernels
 from sglang.kernels.ops.speculative import ragged_verify_kernels
 from sglang.kernels.ops.speculative.dspark import (
+    accept_outs,
+    draft_params,
     dspark_accept,
     dspark_attn_metadata,
     dspark_draft_model,
@@ -344,6 +346,93 @@ def _case_finalize_accept_lens(tc):
         )
 
 
+def _case_accept_outs(tc):
+    # One launch into the in-graph accept's static [:bs] views = finalize +
+    # out tokens + the copies, widened or narrowed where the buffer is.
+    torch.manual_seed(21)
+    for bs, gamma, cl_dtype, prefix_dtype, seq_dtype in (
+        (1, 5, torch.int32, torch.int64, torch.int64),
+        (100, 7, torch.int64, torch.int32, torch.int64),
+        (130, 3, torch.int32, torch.int64, torch.int32),
+    ):
+        T = gamma + 1
+        correct_len = _ri(0, T, (bs,), cl_dtype)
+        bonus = _ri(0, VOCAB, (bs,))
+        cap_trim_lens = _ri(0, 4, (bs,))
+        prefix_lens = _ri(1, 4000, (bs,), prefix_dtype)
+        draft_tokens = _ri(0, VOCAB, (bs, gamma + 2))[:, 1 : gamma + 1]
+        want = dspark_accept.FinalizeAcceptLens.torch(
+            correct_len=correct_len,
+            cap_trim_lens=cap_trim_lens,
+            prefix_lens=prefix_lens,
+        )
+        want_tokens = dspark_verify_window.BuildOutTokens.torch(
+            draft_tokens=draft_tokens,
+            correct_len=correct_len,
+            bonus=bonus,
+            verify_num_draft_tokens=T,
+            gamma=gamma,
+        )
+        rows = bs + 3
+
+        def buf(dtype, *shape):
+            return torch.full((rows, *shape), -1, dtype=dtype, device=DEVICE)[:bs]
+
+        out = types.SimpleNamespace(
+            correct_len=buf(torch.int32),
+            bonus=buf(torch.int64),
+            cap_trim_lens=buf(torch.int32),
+            commit_lens=buf(torch.int32),
+            new_seq_lens=buf(seq_dtype),
+            out_tokens=buf(torch.int64, T),
+        )
+        accept_outs.write_accept_outs_triton(
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=cap_trim_lens,
+            prefix_lens=prefix_lens,
+            draft_tokens=draft_tokens,
+            gamma=gamma,
+            verify_num_draft_tokens=T,
+            out=out,
+        )
+        tc._eq(out.correct_len, correct_len.to(torch.int32))
+        tc._eq(out.bonus, bonus)
+        tc._eq(out.cap_trim_lens, want.cap_trim_lens)
+        tc._eq(out.commit_lens, want.commit_lens)
+        tc._eq(out.new_seq_lens, want.new_seq_lens.to(seq_dtype))
+        tc._eq(out.out_tokens, want_tokens)
+
+
+def _case_draft_params(tc):
+    # The one-launch draft params = the clamp / compare / where chain, a NaN
+    # temperature included, into the leading rows of wider buffers.
+    temps = torch.tensor(
+        [[0.0], [1e-7], [0.7], [float("nan")], [2.0], [1.0]], device=DEVICE
+    )
+    top_ks = torch.tensor([1, 0, 50, 1, 2, 1], dtype=torch.int32, device=DEVICE)
+    bs = 5
+    got = (
+        torch.full((8,), -1.0, device=DEVICE),
+        torch.zeros(8, dtype=torch.bool, device=DEVICE),
+        torch.full((8,), -1.0, device=DEVICE),
+    )
+    draft_params.fill_draft_params(
+        temperatures=temps.view(-1),
+        top_ks=top_ks,
+        temperatures_out=got[0][:bs],
+        greedy_out=got[1][:bs],
+        step_out=got[2][:bs],
+    )
+    ref_t = temps.view(-1)[:bs].float().clamp(min=1e-5)
+    ref_g = top_ks[:bs] <= 1
+    ref_s = torch.where(ref_g, torch.zeros((), device=DEVICE), ref_t)
+    torch.testing.assert_close(got[0][:bs], ref_t, rtol=0, atol=0, equal_nan=True)
+    tc._eq(got[1][:bs], ref_g)
+    torch.testing.assert_close(got[2][:bs], ref_s, rtol=0, atol=0, equal_nan=True)
+    tc._eq(got[0][bs:], torch.full((3,), -1.0, device=DEVICE))
+
+
 def _case_mixed_accept_select(tc):
     torch.manual_seed(14)
     bs = 64
@@ -482,6 +571,8 @@ _CASES = [
     ("swa_page_indices", _case_swa_page_indices),
     ("expand_prefill_causally", _case_expand_prefill_causally),
     ("finalize_accept_lens", _case_finalize_accept_lens),
+    ("accept_outs", _case_accept_outs),
+    ("draft_params", _case_draft_params),
     ("mixed_accept_select", _case_mixed_accept_select),
     ("padded_to_bucket", _case_padded_to_bucket),
     ("page_table_positions", _case_page_table_positions),
