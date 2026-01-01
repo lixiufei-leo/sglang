@@ -50,6 +50,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
+from sglang.srt.layers.dcp.row_gather import dcp_gather_rows_single_pass
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import print_info_once
 
@@ -560,4 +561,9 @@ def dcp_gather_request_rows(
     request, the rows of positions 0..seq_len-1 (the layout of the ragged
     top-k indices).
     """
+    gathered = dcp_gather_rows_single_pass(
+        src=local_rows, index=None, seq_lens_cpu=seq_lens_cpu
+    )
+    if gathered is not None:
+        return gathered
     return all_gather_kv_cache_for_dcp(local_rows, local_rows[:, :0], seq_lens_cpu)

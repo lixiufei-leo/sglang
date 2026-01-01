@@ -126,6 +126,10 @@ from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
+from sglang.srt.layers.dcp.row_gather import (
+    dcp_gather_rows_single_pass,
+    dcp_row_gather_enabled,
+)
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -978,6 +982,11 @@ class DeepseekSparseAttnBackend(
             max_rows = max(model_runner.max_running_requests, 1) * max(
                 self.speculative_num_draft_tokens or 1, 1
             )
+            logger.info(
+                "DSA DCP prefill KV gather (dcp_size=%d): single pass=%s",
+                self.attn_dcp_size,
+                dcp_row_gather_enabled(),
+            )
             if not _is_hip:  # both workspaces are NVLS multicast buffers
                 init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
                 if not get_exec().features.enable_return_indexer_topk:
@@ -1402,6 +1411,14 @@ class DeepseekSparseAttnBackend(
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
+        gathered = dcp_gather_rows_single_pass(
+            src=rows,
+            index=metadata.dcp_local_kv_rows,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            pad_to=self.physical_page_size,
+        )
+        if gathered is not None:
+            return gathered.view(kv_cache.dtype)
         gathered = dcp_gather_request_rows(
             rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
         )
