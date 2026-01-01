@@ -17,6 +17,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SituAndMul
 from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
@@ -24,11 +25,15 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import AttnBank
 from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import row_shard
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    TopKOutputChecker,
+    TopKOutputFormat,
+    build_precomputed_topk_output,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.common import cdiv, get_bool_env_var, print_info_once
 
@@ -50,6 +55,10 @@ _UP_PROJ_COLUMN_SPLIT_MIN_TOKENS = 2048
 _ROW_SHARDED_TAIL_MIN_TOKENS = 4096
 # Crossover vs AITER's A8W4 fused_moe on one MI350X: even at 1K tokens, faster from 2K.
 _A8W4_MOE_MIN_TOKENS = 2048
+# Up to this many tokens the shared experts and the router top-k take two launches off
+# the fused front (k3_moe_epi) instead of three: decode and target-verify batches.
+# Measured faster on MI355X from 1 to 128 tokens; larger batches are unmeasured.
+_FRONT_EPI_MAX_TOKENS = 128
 
 
 class NextAttnRead(msgspec.Struct, frozen=True):
@@ -109,6 +118,7 @@ class KimiK3MoEHipMixin:
     # least _UP_PROJ_COLUMN_SPLIT_MIN_TOKENS tokens.
     _prefill_up_proj_cols: Optional[slice] = None
     _defer_routed_cast_eligible = False
+    _front_epi_eligible = False
     _fused_latent_tail_eligible = False
     # Set by link_column_tails_hip when the next layer's attention read can ride
     # the column-parallel tail's all-gather.
@@ -135,6 +145,7 @@ class KimiK3MoEHipMixin:
             and shared is not None
             and isinstance(shared.act_fn, SituAndMul)
         )
+        self._front_epi_eligible = self._front_epi_static_ok()
         self._fused_latent_tail_eligible = (
             _is_gfx95
             and self.routed_expert_norm is not None
@@ -217,13 +228,21 @@ class KimiK3MoEHipMixin:
             return self._column_split_tail(
                 latent, shared_output, prefix_sum, cols=up_proj_cols
             )
-        if defer_cast:
-            routed_input = self._forward_shared_casting_routed(
-                gate_up, shared_output, routed_input
-            )
-        else:
-            self._forward_shared(gate_up, shared_output)
-        self._forward_routed(hidden_states, router_logits, routed_input, latent)
+        if not self._forward_front_epi(
+            gate_up,
+            router_logits,
+            routed_input,
+            shared_output,
+            latent,
+            cast_routed=defer_cast,
+        ):
+            if defer_cast:
+                routed_input = self._forward_shared_casting_routed(
+                    gate_up, shared_output, routed_input
+                )
+            else:
+                self._forward_shared(gate_up, shared_output)
+            self._forward_routed(hidden_states, router_logits, routed_input, latent)
         if row_sharded:
             return self._row_sharded_tail(
                 latent_rows, shared_rows, num_tokens, prefix_sum
@@ -256,6 +275,126 @@ class KimiK3MoEHipMixin:
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
 
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
+
+    def _front_epi_static_ok(self) -> bool:
+        """Whether _forward_front_epi's kernel reproduces this layer's shared
+        experts and routing: a SiTU shared expert with a dense down weight, and
+        sigmoid + correction-bias ungrouped top-k at scale 1 on the AITER runner."""
+        from sglang.kernels.ops.moe import k3_moe_epi
+
+        if not (_use_aiter and self._eligible_for_fused_front):
+            return False
+        runner = self.experts.runner
+        if runner is None or not runner.runner_backend.is_aiter():
+            return False
+        shared = self.shared_experts
+        if shared is None or not isinstance(shared.act_fn, SituAndMul):
+            return False
+        w_down = shared.down_proj.weight
+        if not (
+            isinstance(w_down, torch.Tensor)
+            and w_down.dtype in (torch.bfloat16, torch.float16)
+            and w_down.dim() == 2
+            and w_down.is_contiguous()
+        ):
+            return False
+        topk, cfg = self.topk, self.topk.topk_config
+        return (
+            cfg.output_format in (None, TopKOutputFormat.STANDARD)
+            and cfg.scoring_func == "sigmoid"
+            and cfg.correction_bias is not None
+            and cfg.correction_bias.dim() == 1
+            and (cfg.num_expert_group or 1) == 1
+            and (cfg.topk_group or 1) == 1
+            and cfg.num_shared_topk_slots == 0
+            and cfg.custom_routing_function is None
+            and cfg.routed_scaling_factor in (None, 1.0)
+            and topk.waterfill_balancer is None
+            and not topk.enable_waterfill
+            and k3_moe_epi.topk_supported(self._front_sizes[1], cfg.top_k)
+            and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            and not get_exec().deterministic.enable_deterministic_inference
+        )
+
+    def _forward_front_epi(
+        self,
+        gate_up: torch.Tensor,
+        router_logits: torch.Tensor,
+        routed_input: torch.Tensor,
+        shared_output: torch.Tensor,
+        latent: torch.Tensor,
+        *,
+        cast_routed: bool,
+    ) -> bool:
+        """The shared experts (with the fp32 routed input's bf16 cast) and the
+        router top-k in two launches off the fused front (k3_moe_epi), then the
+        routed experts; False, before anything runs, when they do not take the batch."""
+        from sglang.kernels.ops.moe import k3_moe_epi
+
+        num_tokens = gate_up.shape[0]
+        w_down = self.shared_experts.down_proj.weight
+        cfg = self.topk.topk_config
+        if not (
+            self._front_epi_eligible
+            and num_tokens <= _FRONT_EPI_MAX_TOKENS
+            and gate_up.stride(1) == 1
+            and routed_input.stride(1) == 1
+            and k3_moe_epi.shared_down_topk_fits(
+                w_down, shared_output, router_logits, cfg.correction_bias, cfg.top_k
+            )
+        ):
+            return False
+        num_token_non_padded, dispatch_info = self.topk.routing_inputs()
+        if dispatch_info is not None:
+            # placement remaps (and fake dispatch rewrites) the routing; TopK owns it
+            return False
+        device = gate_up.device
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            topk_ids = torch.empty(
+                (num_tokens, cfg.top_k), dtype=torch.int32, device=device
+            )
+            topk_weights = torch.empty(
+                (num_tokens, cfg.top_k), dtype=torch.float32, device=device
+            )
+        cast = None
+        if cast_routed:
+            dense = torch.empty(
+                routed_input.shape, dtype=shared_output.dtype, device=device
+            )
+            cast, routed_input = (routed_input, dense), dense
+        act_fn = self.shared_experts.act_fn
+        act = torch.empty(
+            (num_tokens, w_down.shape[1]), dtype=w_down.dtype, device=device
+        )
+        k3_moe_epi.situ_cast(gate_up, act, act_fn.beta, act_fn.linear_beta, cast)
+        k3_moe_epi.shared_down_topk(
+            act,
+            w_down,
+            shared_output,
+            k3_moe_epi.Router(
+                router_logits,
+                cfg.correction_bias,
+                topk_ids,
+                topk_weights,
+                cfg.renormalize,
+                1.0,
+            ),
+        )
+        topk_output = build_precomputed_topk_output(
+            topk_weights,
+            topk_ids,
+            cfg,
+            self.layer_idx,
+            num_token_non_padded=num_token_non_padded,
+        )
+        with zero_copy_context.set_moe_output(latent):
+            expert_output = self.experts(routed_input, topk_output)
+        if expert_output.data_ptr() != latent.data_ptr():
+            latent.copy_(expert_output)
+        return True
 
     def _forward_shared_casting_routed(
         self,
