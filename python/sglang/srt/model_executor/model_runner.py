@@ -1682,8 +1682,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
         clear_global_lplb_solvers()
         ep_group = get_moe_ep_group()
+        solver_cls = LPLBSolver
+        if _is_hip and self.server_args.moe_a2a_backend == "mori":
+            from sglang.srt.layers.moe.token_dispatcher.mori_lplb import (
+                MoriLPLBSolver,
+            )
+
+            solver_cls = MoriLPLBSolver
         for lid in range(metadata.num_layers):
-            solver = LPLBSolver(
+            solver = solver_cls(
                 phy2log=metadata.physical_to_logical_map[lid],
                 log2phy=metadata.logical_to_all_physical_map[lid],
                 num_gpus=metadata.ep_size,

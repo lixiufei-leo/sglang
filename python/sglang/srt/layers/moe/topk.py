@@ -1764,6 +1764,17 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:
+        log2phy_prob = None
+        if (
+            expert_location_dispatch_info is not None
+            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
+            == "lp"
+        ):
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                log2phy_prob = lplb_solver.solve(topk_ids)
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
         # (negative indices cause illegal memory access). Always fill the padded
         # region with 0 so every kernel sees a valid in-range expert id.
@@ -1772,10 +1783,21 @@ def _post_process_topk_ids(
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        if log2phy_prob is not None:
+            from sglang.srt.layers.moe.token_dispatcher.mori_lplb import (
+                dispatch_probability_torch,
+            )
+
+            topk_ids = dispatch_probability_torch(
+                topk_ids,
+                log2phy_prob,
+                expert_location_dispatch_info.partial_logical_to_all_physical_map,
+            )
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if _eplb_remap_enabled():
+        elif _eplb_remap_enabled():
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
