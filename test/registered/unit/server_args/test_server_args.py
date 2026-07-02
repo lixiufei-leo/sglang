@@ -183,6 +183,35 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
 
+class TestWaterfillA2ABackend(unittest.TestCase):
+    def test_waterfill_preserves_mori_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_deepep_waterfill=True,
+            moe_a2a_backend="mori",
+            tp_size=8,
+            chunked_prefill_size=0,
+        )
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.moe_a2a_backend, "mori")
+        self.assertEqual(server_args.ep_size, 8)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+        self.assertFalse(server_args.disable_shared_experts_fusion)
+
+    def test_waterfill_defaults_to_deepep_for_unsupported_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_deepep_waterfill=True,
+            moe_a2a_backend="none",
+            tp_size=8,
+        )
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.moe_a2a_backend, "deepep")
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):

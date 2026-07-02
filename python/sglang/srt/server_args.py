@@ -1769,7 +1769,7 @@ class ServerArgs:
     ] = None
     enable_deepep_waterfill: A[
         bool,
-        "Enable DeepEP Waterfill: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets --moe-a2a-backend deepep, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency. Use auto or low_latency for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+        "Enable Waterfill for supported EP backends: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets --moe-a2a-backend deepep unless a supported backend such as mori is selected, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency. Use auto or low_latency for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
     ] = False
     elastic_ep_rejoin: A[
         bool,
@@ -5520,10 +5520,14 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
-        if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
+        waterfill_backends = ("deepep", "mori")
+        if (
+            self.enable_deepep_waterfill
+            and self.moe_a2a_backend not in waterfill_backends
+        ):
             logger.warning(
-                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
-                "Waterfill requires the DeepEP backend."
+                "moe_a2a_backend is overridden to 'deepep' because "
+                "Waterfill requires a supported EP backend."
             )
             self.moe_a2a_backend = "deepep"
 
@@ -5555,16 +5559,18 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-            if self.enable_deepep_waterfill:
-                if self.disable_shared_experts_fusion:
-                    logger.warning(
-                        "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
-                    )
-                    self.disable_shared_experts_fusion = False
-                self.enforce_shared_experts_fusion = True
-                logger.info(
-                    "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
+
+        if self.enable_deepep_waterfill:
+            if self.disable_shared_experts_fusion:
+                logger.warning(
+                    "disable_shared_experts_fusion is overridden to False because Waterfill requires shared expert fusion."
                 )
+                self.disable_shared_experts_fusion = False
+            self.enforce_shared_experts_fusion = True
+            logger.info(
+                "Waterfill is enabled. Shared expert will be dispatched through %s for load balancing.",
+                self.moe_a2a_backend,
+            )
 
         if self.moe_a2a_backend == "mooncake":
             self.ep_size = self.tp_size

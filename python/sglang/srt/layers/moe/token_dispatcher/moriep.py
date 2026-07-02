@@ -721,8 +721,16 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         # mori local_expert_count is a GPU tensor; route it through the
         # low_latency hook only when the recorder is actually active.
         if record:
+            local_expert_count = self.mori_op.local_expert_count
+            num_routed_local_experts = self.num_experts // get_parallel().moe_ep_size
+            if local_expert_count.shape[0] > num_routed_local_experts:
+                # Waterfill dispatches the fused shared expert through Mori as
+                # an extra local slot. EPLB statistics only track routed
+                # physical experts, so keep the existing recorder contract by
+                # stripping Mori's shared-expert count before reporting.
+                local_expert_count = local_expert_count[:num_routed_local_experts]
             get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-                self.mori_op.local_expert_count
+                local_expert_count
             )
 
         return (
