@@ -99,6 +99,42 @@ def _ep_rank_world():
     return torch.distributed.get_rank(group), torch.distributed.get_world_size(group)
 
 
+_MORI_SHMEM_READY = False
+
+
+def _ensure_mori_shmem() -> None:
+    """Initialize mori's (process-global) symmetric heap over the MoE EP group.
+
+    FlyDSL's MegaMoE / dispatch_combine allocate from mori's shmem heap
+    (``shmem_malloc``), which aborts unless ``shmem_torch_process_group_init``
+    has run. sglang only does that inside the moriep token dispatcher (group
+    "mori"), which the megamoe a2a backend bypasses -- so we bootstrap it here,
+    once, mirroring moriep's register+init pattern. mori shmem is a per-process
+    singleton, so a single init on the EP group is what all MegaMoE layers use.
+
+    Must be reached collectively by every EP rank (it broadcasts a unique id);
+    the first routed forward (incl. warmup) is such a point.
+    """
+    global _MORI_SHMEM_READY
+    if _MORI_SHMEM_READY:
+        return
+    import mori.shmem
+
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    group_name = "megamoe_flydsl"
+    cpu_group = get_moe_ep_group().cpu_group
+    try:
+        torch._C._distributed_c10d._register_process_group(group_name, cpu_group)
+    except Exception as e:  # noqa: BLE001
+        if "already registered" not in str(e):
+            raise
+        # Group already registered (e.g. re-entry): shmem was initialized too.
+    else:
+        mori.shmem.shmem_torch_process_group_init(group_name)
+    _MORI_SHMEM_READY = True
+
+
 # ---------------------------------------------------------------------------
 # Weight layout (accuracy-critical). Mirrors FlyDSL tests/kernels/test_mega_moe.py
 # _prepare(): raw fp4 -> shuffle_weight(layout=(16,16)) + fp4_utils.e8m0_shuffle,
@@ -166,6 +202,7 @@ def _get_or_build_mega_moe(
 ):
     """Return the shared MegaMoE, building it once from ``layer``'s weights."""
     _ensure_flydsl_on_path()
+    _ensure_mori_shmem()
     from kernels.mega_moe import MegaMoE  # noqa: E402  FlyDSL repo
 
     rank, world = _ep_rank_world()
