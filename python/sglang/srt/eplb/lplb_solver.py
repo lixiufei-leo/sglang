@@ -175,14 +175,14 @@ class LPLBSolver:
         # without per-call .long() casts (Tier 1 optimization).
         self.log2phy = log2phy.to(torch.int64).contiguous()
 
-        # Pre-JIT-compile the fused IPM kernel for this (NC, NV) shape so the
-        # 20-40s compile cost happens once at startup rather than on the first
-        # real request. No-op when the fused backend is unavailable.
+        # Warm up / prepare the LP backend for this (NC, NV) shape. The base
+        # CUDA path JIT-compiles the fused IPM kernel here (20-40s, once) so the
+        # first real request doesn't pay it. Subclasses that solve the LP with a
+        # different backend (e.g. MoriLPLBSolver's torch IPM on ROCm) override
+        # ``_warmup_solver`` — there is nothing to precompile there.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        from sglang.jit_kernel.lplb.torch_solver import warmup as _ipm_warmup
-
-        _ipm_warmup(nc, nv, num_iters=5, device=device)
+        self._warmup_solver(nc, nv, device)
 
         # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
@@ -200,6 +200,17 @@ class LPLBSolver:
         self._log2phy_prob = torch.empty(
             log2phy.shape, dtype=torch.float32, device=device
         )
+
+    def _warmup_solver(self, nc: int, nv: int, device) -> None:
+        """Prepare the LP solve backend for this (NC, NV) shape.
+
+        Base (CUDA) backend: JIT-compile the fused cuBLASDx IPM kernel so the
+        first real request doesn't pay the 20-40s compile. Subclasses with a
+        torch backend override this to a no-op.
+        """
+        from sglang.jit_kernel.lplb.torch_solver import warmup as _ipm_warmup
+
+        _ipm_warmup(nc, nv, num_iters=5, device=device)
 
     def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """

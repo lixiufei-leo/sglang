@@ -1,19 +1,32 @@
 """Mori-specific LPLB helpers for ROCm.
 
-The generic LPLB solver uses CUDA JIT kernels backed by cuBLASDx. Mori on AMD
-needs the same logical-to-physical probability interface, but the decode CUDA
-graph capture path cannot call torch.linalg on HIP. This module therefore keeps
-the Mori path graph-capture friendly by using regular tensor/index operations to
-produce per-batch physical-expert probabilities.
+The generic :class:`LPLBSolver` solves the load-balancing LP with a fused
+JIT CUDA kernel backed by cuBLASDx (Hopper+ / Math-DX), which is not
+available on HIP. :class:`MoriLPLBSolver` keeps the *exact same* LP —
+same constraint matrices, same barrier-method interior-point solve, same
+probability extraction — but runs it through torch ops so it works on
+AMD. It is a drop-in subclass of :class:`LPLBSolver`: only the solve
+backend differs, so the math stays bit-for-bit aligned with the NVIDIA
+path (modulo the LU-vs-Cholesky KKT factorization inside the IPM, exactly
+as the NV torch reference already differs from its own CUDA kernel).
+
+Enablement is driven purely by ``--ep-dispatch-algorithm lp`` (see
+``ModelRunner._init_lplb_solvers``); there is no prefill/decode
+auto-detection here. The torch IPM uses ``torch.linalg.solve`` and so is
+not CUDA-graph-capturable — that is fine because the LP solve runs eager,
+outside any captured region, on both NV and ROCm (its EP all-reduce
+cannot live inside a compiled/captured graph anyway).
 """
 
 from __future__ import annotations
 
 import torch
 
+from sglang.srt.eplb.lplb_solver import LPLBSolver
 
-class MoriLPLBSolver:
-    """Torch implementation of LPLBSolver for Mori/HIP."""
+
+class MoriLPLBSolver(LPLBSolver):
+    """Torch-backed LPLBSolver for Mori/HIP — exact LP, no CUDA kernels."""
 
     def __init__(
         self,
@@ -23,116 +36,72 @@ class MoriLPLBSolver:
         ep_group=None,
         logical_to_all_physical_map_num_valid=None,
     ):
+        # Reuse the base solver's constraint-matrix construction verbatim so the
+        # LP is identical to the NVIDIA path. Only the solve backend differs.
+        super().__init__(
+            phy2log=phy2log,
+            log2phy=log2phy,
+            num_gpus=num_gpus,
+            ep_group=ep_group,
+            logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
+        )
+
         device = phy2log.device
-        self.num_gpus = num_gpus
-        self.ep_group = ep_group
-        self.num_logical = log2phy.shape[0]
-        self.max_copies = log2phy.shape[1]
-        self.num_phy = phy2log.shape[0]
 
-        if self.num_phy % num_gpus != 0:
-            raise ValueError(
-                f"MoriLPLBSolver requires num_phy ({self.num_phy}) to be divisible "
-                f"by num_gpus ({num_gpus}); per-rank-contiguous ownership is "
-                "currently the only supported allocation."
-            )
-        num_phy_per_gpu = self.num_phy // num_gpus
-
-        logcnt = torch.bincount(phy2log, minlength=self.num_logical)
-        self.log_single = torch.nonzero(logcnt == 1).flatten().to(torch.int64)
-        self.phy_single = log2phy[self.log_single, 0].to(torch.int64)
-        self.log_replicated = torch.nonzero(logcnt > 1).flatten().to(torch.int64)
-        self.phy_replicated = (
-            torch.nonzero(logcnt[phy2log] > 1).flatten().to(torch.int64)
+        # ``lp_post`` scatters into a (num_phy + 1)-wide vector whose last slot
+        # is an always-zero "sink" for padded (-1) replicas. Pre-allocate it and
+        # a gather index that maps log2phy's -1 entries to that sink slot, so the
+        # per-solve extraction is a single index_select into a reused buffer.
+        self._phy_prob = torch.zeros(
+            self.num_phy + 1, dtype=torch.float32, device=device
         )
+        self._log2phy_gather = torch.where(
+            self.log2phy < 0,
+            torch.full_like(self.log2phy, self.num_phy),
+            self.log2phy,
+        ).reshape(-1)
 
-        self.num_single = len(self.log_single)
-        self.num_red_log = len(self.log_replicated)
-        self.num_red_phy = len(self.phy_replicated)
-
-        b_full = torch.zeros(
-            (num_gpus, self.num_phy), dtype=torch.float32, device=device
-        )
-        for i in range(num_gpus):
-            b_full[i, i * num_phy_per_gpu : (i + 1) * num_phy_per_gpu] = 1
-        self.B1 = b_full[:, self.phy_single].contiguous()
-        b2 = b_full[:, self.phy_replicated]
-
-        c = torch.zeros(
-            (self.num_red_log, self.num_red_phy), dtype=torch.float32, device=device
-        )
-        phy2log_rep = phy2log[self.phy_replicated]
-        for i in range(self.num_red_log):
-            c[i, phy2log_rep == self.log_replicated[i]] = 1.0
-
-        zeros_top_g = torch.zeros(
-            (self.num_red_log, num_gpus), dtype=torch.float32, device=device
-        )
-        zeros_top_1 = torch.zeros(
-            (self.num_red_log, 1), dtype=torch.float32, device=device
-        )
-        eye_g = torch.eye(num_gpus, dtype=torch.float32, device=device)
-        neg_ones = torch.full((num_gpus, 1), -1.0, dtype=torch.float32, device=device)
-
-        a_top = torch.hstack([c, zeros_top_g, zeros_top_1])
-        a_bottom = torch.hstack([b2, eye_g, neg_ones])
-        self.A_base = torch.vstack([a_top, a_bottom]).contiguous()
-        self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()
-
-        nv = self.A_base.shape[1] + 1
-        self.c_vec = torch.zeros(nv, dtype=torch.float32, device=device)
-        self.c_vec[-2] = 1.0
-        self.c_vec[-1] = 1000.0
-
-        self.log2phy = log2phy.to(torch.int64).contiguous()
-        self._log2phy_valid = (self.log2phy >= 0).to(torch.float32).contiguous()
-        self._log2phy_owner = self.log2phy.clamp(min=0).div(
-            num_phy_per_gpu, rounding_mode="floor"
-        )
-
-        self._counts_norm = torch.empty(self.num_logical, dtype=torch.float32, device=device)
-        self._t1 = torch.empty(self.num_single, dtype=torch.float32, device=device)
-        self._gpu_load = torch.empty(num_gpus, dtype=torch.float32, device=device)
-        self._candidate_load = torch.empty(
-            log2phy.shape, dtype=torch.float32, device=device
-        )
-        self._log2phy_prob = torch.empty(
-            log2phy.shape, dtype=torch.float32, device=device
-        )
-
-    def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
-        device = topk_ids.device
-        local_counts = torch.zeros(self.num_logical, dtype=torch.int32, device=device)
-        flat_ids = topk_ids.flatten()
-        local_counts.scatter_add_(
-            0,
-            flat_ids.long(),
-            torch.ones_like(flat_ids, dtype=torch.int32),
-        )
-
-        global_counts = local_counts.float()
-        if self.ep_group is not None:
-            global_counts = self.ep_group.all_reduce(global_counts)
-
-        return self._solve(global_counts)
+    def _warmup_solver(self, nc: int, nv: int, device) -> None:
+        # Torch IPM backend: nothing to JIT-compile.
+        return
 
     def _solve(self, global_counts: torch.Tensor) -> torch.Tensor:
-        torch.div(
-            global_counts,
-            global_counts.sum().clamp(min=1.0),
-            out=self._counts_norm,
-        )
-        torch.index_select(self._counts_norm, 0, self.log_single, out=self._t1)
-        torch.mv(self.B1, self._t1, out=self._gpu_load)
+        """Exact LP solve in torch — mirrors the NV prep/IPM/post kernels.
 
-        # HIP graph capture rejects the torch.linalg-based IPM solver. Use a
-        # graph-safe pressure heuristic: prefer physical copies on GPUs with
-        # lower single-expert load, and fall back to uniform weights when loads
-        # are equal.
-        torch.take(self._gpu_load, self._log2phy_owner, out=self._candidate_load)
-        self._candidate_load.add_(1e-6)
-        torch.reciprocal(self._candidate_load, out=self._log2phy_prob)
-        self._log2phy_prob.mul_(self._log2phy_valid)
+        Steps map 1:1 to ``csrc/lplb/lp_prep.cuh``, ``csrc/lplb/ipm.cuh``
+        (via :func:`solve_ipm_torch_reference`), and ``csrc/lplb/lp_post.cuh``.
+        """
+        from sglang.jit_kernel.lplb.torch_solver import solve_ipm_torch_reference
+
+        # ---- prep (lp_prep.cuh) ----
+        #   counts_norm = global_counts / total.clamp(min=1.0)
+        #   t1 = counts_norm[log_single]; b1 = counts_norm[log_replicated]
+        #   b2 = -(B1 @ t1); b = cat(b1, b2)
+        #   A_full[:, -1] = b - A_base_row_sum   (first NV-1 cols are A_base)
+        total = global_counts.sum().clamp(min=1.0)
+        counts_norm = global_counts / total
+        torch.index_select(counts_norm, 0, self.log_single, out=self._t1)
+        b1 = counts_norm[self.log_replicated]
+        b2 = -(self.B1 @ self._t1)
+        b = torch.cat([b1, b2])
+        self._A_full[:, -1] = b - self._A_base_row_sum
+
+        # ---- IPM (ipm.cuh) ----
+        x = solve_ipm_torch_reference(self._A_full, b, self.c_vec, num_iters=5)
+
+        # ---- post (lp_post.cuh) ----
+        #   phy_prob = 0; phy_prob[phy_replicated] = clamp(x[:num_red_phy], min=0)
+        #   phy_prob[phy_single] = t1
+        #   log2phy_prob = phy_prob[log2phy]   (-1 -> zero sink slot)
+        self._phy_prob.zero_()
+        self._phy_prob[self.phy_replicated] = x[: self.num_red_phy].clamp(min=0.0)
+        self._phy_prob[self.phy_single] = self._t1
+        torch.index_select(
+            self._phy_prob,
+            0,
+            self._log2phy_gather,
+            out=self._log2phy_prob.view(-1),
+        )
         return self._log2phy_prob
 
 
@@ -141,7 +110,12 @@ def dispatch_probability_torch(
     log2phy_prob: torch.Tensor,
     log2phy_map: torch.Tensor,
 ) -> torch.Tensor:
-    """Sample physical expert ids from LP probabilities with torch ops."""
+    """Sample physical expert ids from LP probabilities with torch ops.
+
+    Faithful torch port of the NV ``dispatch_probability`` CUDA kernel
+    (inverse-CDF sampling); see
+    ``jit_kernel.lplb.cuda_solver.dispatch_probability_torch_reference``.
+    """
 
     original_shape = topk_ids.shape
     flat_ids = topk_ids.reshape(-1).long()
