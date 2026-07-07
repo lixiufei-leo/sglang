@@ -223,7 +223,14 @@ def _get_or_build_mega_moe(
             w2=layer._mega_w2,
             w2_scale=layer._mega_w2_scale,
             max_tok_per_rank=mtpr,
-            # gemm2 tile left at auto (-1) -> MegaMoE loads its tune table.
+            # Explicit GEMM2 tile, matching the validated standalone bench
+            # (tests/kernels/test_mega_moe.py: tm2/tn2/tk2 = 32/128/256). The
+            # default (-1 -> MegaGemm2 auto tune-table) selects a tile whose
+            # _k_shift_bits emits an invalid arith.constant (std::bad_cast) at
+            # some token counts. Pinning the bench tile avoids that path.
+            gemm2_tile_m=32,
+            gemm2_tile_n=128,
+            gemm2_tile_k=256,
         )
         _MEGA_MOE_INSTANCE[key] = mega
     return mega
