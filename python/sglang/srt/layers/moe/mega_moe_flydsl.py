@@ -354,7 +354,13 @@ def _run_mega_routed(
         inter_dim=inter_dim,
         experts=num_experts,
         topk=top_k,
-        quant=getattr(moe.experts, "_mega_quant", "a8w4"),
+        # Weight layout is identical for a4w4/a8w4 (only activation quant
+        # differs), so SGLANG_AMD_FLYDSL_MEGA_QUANT can force a8w4 (fp8 acts) on
+        # an a4w4 checkpoint to isolate fused-kernel accuracy from weight-conv.
+        quant=(
+            os.environ.get("SGLANG_AMD_FLYDSL_MEGA_QUANT")
+            or getattr(moe.experts, "_mega_quant", "a8w4")
+        ),
     )
     _swap_layer_weights(mega, moe.experts)
 
