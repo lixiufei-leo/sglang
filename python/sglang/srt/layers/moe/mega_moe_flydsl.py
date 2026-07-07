@@ -136,48 +136,64 @@ def _ensure_mori_shmem() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Weight layout (accuracy-critical). Mirrors FlyDSL tests/kernels/test_mega_moe.py
-# _prepare(): raw fp4 -> shuffle_weight(layout=(16,16)) + fp4_utils.e8m0_shuffle,
-# NOT aiter's shuffle. In sglang EP each rank already holds ONLY its local
-# experts, so no global-slice is needed (unlike the standalone test which builds
-# global weights then slices). We therefore feed the layer's local buffers
-# directly as MegaMoE's per-rank w1/w2.
+# Weight layout (accuracy-critical). We do NOT feed the quark checkpoint's fp4
+# bytes straight into shuffle_weight: quark's MXFP4 encode convention (e.g. the
+# max->dtypeMax scale mapping) need not match what FlyDSL's kernel assumes, so a
+# direct reuse silently corrupts magnitudes (gsm8k 0.96 -> ~0.5). Instead we
+# dequantize with the standard OCP decode (convention-independent) and re-encode
+# with FlyDSL's OWN quantizer -- exactly the prep the standalone bench
+# (tests/kernels/test_mega_moe.py::_prepare) validates: raw fp4 (from
+# _per_1x32_fp4_quant) -> shuffle_weight(16,16) + fp4_utils.e8m0_shuffle. In
+# sglang EP each rank already holds ONLY its local experts, so no global-slice.
 # ---------------------------------------------------------------------------
 def build_mega_moe_experts_weights(layer) -> None:
     if getattr(layer, "_mega_moe_weights_built", False):
         return
 
     _ensure_flydsl_on_path()
+    from tests.kernels.test_moe_gemm import _per_1x32_fp4_quant  # FlyDSL quantizer
     from tests.kernels.utils import fp4_utils  # noqa: E402  FlyDSL repo
     from tests.utils import shuffle_weight  # noqa: E402  FlyDSL repo (NOT aiter)
 
     fp4_view = torch.float4_e2m1fn_x2
 
+    def _requant_shuffle(w_u8_3d, scale_u8_3d):
+        """quark (fp4 bytes + e8m0 scale) -> f32 -> FlyDSL fp4 -> shuffled bytes.
+
+        w_u8_3d: [E, rows, K//2] uint8 (2 fp4/byte); scale_u8_3d: [E, rows, K//32]
+        e8m0 uint8. Returns (w_shuffled_flat_u8, scale_shuffled_flat_u8).
+        """
+        e, rows, k_half = w_u8_3d.shape
+        k = k_half * 2
+        vals = fp4_utils.mxfp4_to_f32(w_u8_3d.view(fp4_view))  # [E, rows, K]
+        sc = fp4_utils.e8m0_to_f32(scale_u8_3d)  # [E, rows, K//32]
+        w_f32 = (vals.view(e, rows, k // 32, 32) * sc.view(e, rows, k // 32, 1)).view(
+            e * rows, k
+        )
+        del vals, sc
+        w_fp4, w_scale = _per_1x32_fp4_quant(w_f32)  # FlyDSL convention
+        del w_f32
+        w_out = shuffle_weight(w_fp4).view(torch.uint8).contiguous().view(-1)
+        s_out = fp4_utils.e8m0_shuffle(w_scale).view(torch.uint8).contiguous().view(-1)
+        return w_out, s_out
+
     e_local = layer.w13_weight.shape[0]
     # Padded dims (round_up 256 in the quark scheme) -- use them, per ATOM guide.
-    w13_rows = layer.w13_weight.shape[1]  # == 2 * inter_dim (gate|up concat)
     hidden = layer.w13_weight.shape[2] * 2  # packed fp4 -> 2 values/byte
-    w2_rows = layer.w2_weight.shape[1]  # == hidden
-    inter = layer.w2_weight.shape[2] * 2  # packed fp4 -> 2 values/byte
+    inter = layer.w2_weight.shape[2] * 2
 
-    w13 = layer.w13_weight.data.reshape(e_local * w13_rows, hidden // 2).view(fp4_view)
-    w2 = layer.w2_weight.data.reshape(e_local * w2_rows, inter // 2).view(fp4_view)
-    w13_s = layer.w13_weight_scale.data.reshape(e_local * w13_rows, hidden // 32)
-    w2_s = layer.w2_weight_scale.data.reshape(e_local * w2_rows, inter // 32)
-
-    layer._mega_w1 = shuffle_weight(w13).view(torch.uint8).contiguous().view(-1)
-    layer._mega_w2 = shuffle_weight(w2).view(torch.uint8).contiguous().view(-1)
-    layer._mega_w1_scale = (
-        fp4_utils.e8m0_shuffle(w13_s).view(torch.uint8).contiguous().view(-1)
+    layer._mega_w1, layer._mega_w1_scale = _requant_shuffle(
+        layer.w13_weight.data, layer.w13_weight_scale.data
     )
-    layer._mega_w2_scale = (
-        fp4_utils.e8m0_shuffle(w2_s).view(torch.uint8).contiguous().view(-1)
+    layer._mega_w2, layer._mega_w2_scale = _requant_shuffle(
+        layer.w2_weight.data, layer.w2_weight_scale.data
     )
+    dev = layer.w13_weight.device
 
     # Pitfall 2: the original fp4 buffers are now dead fallback. Keeping them
     # doubles expert-weight memory and crushes the KV cache; drop them.
-    layer.w13_weight.data = torch.empty(0, dtype=torch.uint8, device=w13.device)
-    layer.w2_weight.data = torch.empty(0, dtype=torch.uint8, device=w2.device)
+    layer.w13_weight.data = torch.empty(0, dtype=torch.uint8, device=dev)
+    layer.w2_weight.data = torch.empty(0, dtype=torch.uint8, device=dev)
 
     layer._mega_moe_weights_built = True
     logger.info(
