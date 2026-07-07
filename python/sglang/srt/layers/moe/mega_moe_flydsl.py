@@ -318,11 +318,21 @@ def _run_mega_routed(
             ),
             **topk_kwargs,
         )
+        x_in = hidden_states
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights.to(torch.float32)
     else:
-        topk_ids = hidden_states.new_empty((0, top_k), dtype=torch.int32)
-        topk_weights = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+        # Idle DP rank (0 real tokens). The mega forward is a collective (mori
+        # dispatch + combine), so every EP rank must still call it -- skipping
+        # would deadlock the a2a. But FlyDSL's kernels need >=1 row (a 0-sized
+        # grid raises "HIP error: invalid configuration argument"), so run one
+        # dummy token (balanced routing, zero weight) and slice it back off.
+        x_in = hidden_states.new_zeros((1, hidden_size))
+        topk_ids = (
+            torch.arange(top_k, device=hidden_states.device, dtype=torch.int32)
+            % num_experts
+        ).unsqueeze(0)
+        topk_weights = hidden_states.new_zeros((1, top_k), dtype=torch.float32)
 
     mtpr = _mtpr()
     assert num_tokens <= mtpr, (
@@ -343,7 +353,7 @@ def _run_mega_routed(
 
     # forward_bf16 == forward: bf16 in, single fused op, bf16 out. Fused stage-1
     # quantizes internally to fp8 (a8w4), so we hand it bf16 activations directly.
-    y = mega.forward_bf16(hidden_states, topk_weights, topk_ids)
+    y = mega.forward_bf16(x_in, topk_weights, topk_ids)
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
