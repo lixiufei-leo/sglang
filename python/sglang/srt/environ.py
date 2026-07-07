@@ -872,6 +872,19 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
+    # AMD FlyDSL Mega MoE (gfx950 / a8w4). Alternative backend to the DeepGEMM
+    # mega-moe above: routes DeepseekV2MoE through FlyDSL's fused MegaMoE
+    # (dispatch + gemm1 + quant + gemm2 + combine in a single op) over mori
+    # intranode all-to-all. Requires --moe-a2a-backend megamoe to also be set;
+    # this flag only selects the FlyDSL implementation over DeepGEMM's.
+    SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
+    # max_tok_per_rank for the FlyDSL MegaMoE symmetric buffers. MUST be a power
+    # of two (MegaMoE asserts this). Mirrors ATOM_MEGA_MTPR.
+    SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
+    # Directory of the FlyDSL workspace that provides `kernels.mega_moe`. Falls
+    # back to $ATOM_FLYDSL_KERNELS_PATH when empty.
+    SGLANG_AMD_FLYDSL_KERNELS_PATH = EnvStr("")
+
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
