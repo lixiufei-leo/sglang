@@ -836,6 +836,8 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
     optimistic_prefill_retries: int = 0
+    # PoC: allow runtime prefill<->decode role switching via /pd_role_switch.
+    enable_pd_role_switch: bool = False
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -7035,6 +7037,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.optimistic_prefill_retries,
             help="Number of optimistic prefill retries that will skip the bootstrap wait. ",
+        )
+        parser.add_argument(
+            "--enable-pd-role-switch",
+            action="store_true",
+            help="Allow runtime prefill<->decode role switching for this instance via the /pd_role_switch endpoint (PD mode). Default off.",
         )
 
         # Encode prefill disaggregation

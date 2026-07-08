@@ -1696,6 +1696,33 @@ class SlowDownReqOutput(BaseReq):
 
 
 @dataclass
+class PdRoleSwitchReqInput(BaseReq):
+    # Target disaggregation role: "prefill" or "decode".
+    new_role: str = ""
+    # Drain policy: "reject" (fail if busy), "graceful" (finish in-flight
+    # then flip, for prefill), or "migrate" (move in-flight to migrate_url
+    # then flip, for decode).
+    drain_policy: str = "reject"
+    # For drain_policy="migrate": base URL (router) to re-submit in-flight
+    # decode requests to before flipping.
+    migrate_url: str = ""
+
+
+@dataclass
+class PdRoleSwitchReqOutput(BaseReq):
+    success: bool = False
+    message: str = ""
+    old_role: str = ""
+    new_role: str = ""
+    # True if the flip already happened during this call; False if it was
+    # only scheduled (graceful/migrate drain still in progress).
+    flipped: bool = False
+    drained: bool = False
+    migrated: int = 0
+    aborted: int = 0
+
+
+@dataclass
 class AbortReq(BaseReq):
     # Whether to abort all requests
     abort_all: bool = False

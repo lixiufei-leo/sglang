@@ -299,6 +299,9 @@ class MoriKVManager(CommonKVManager):
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
+        # Set by teardown() to make worker threads exit (PoC role switch).
+        self._stopped = False
+        self._worker_threads: List[threading.Thread] = []
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -507,9 +510,14 @@ class MoriKVManager(CommonKVManager):
         return payload
 
     def _start_bootstrap_thread(self) -> None:
+        poller = zmq.Poller()
+        poller.register(self.server_socket, zmq.POLLIN)
+
         def bootstrap_worker():
-            while True:
+            while not self._stopped:
                 try:
+                    if not dict(poller.poll(timeout=500)):
+                        continue
                     msg = self.server_socket.recv_multipart()
                     payload = self._validate_message(msg)
                     if payload is None:
@@ -521,9 +529,13 @@ class MoriKVManager(CommonKVManager):
                     else:
                         self._handle_transfer_message(payload)
                 except Exception:
+                    if self._stopped:
+                        break
                     logger.exception("Bootstrap worker failed")
 
-        threading.Thread(target=bootstrap_worker, daemon=True).start()
+        _t = threading.Thread(target=bootstrap_worker, daemon=True)
+        _t.start()
+        self._worker_threads.append(_t)
 
     def _cleanup_room_tracking(self, bootstrap_room: int) -> None:
         bootstrap_addr = self.room_to_bootstrap_addr.pop(bootstrap_room, None)
@@ -535,9 +547,14 @@ class MoriKVManager(CommonKVManager):
                     self.addr_to_rooms_tracker.pop(bootstrap_addr, None)
 
     def _start_decode_thread(self) -> None:
+        poller = zmq.Poller()
+        poller.register(self.server_socket, zmq.POLLIN)
+
         def decode_worker():
-            while True:
+            while not self._stopped:
                 try:
+                    if not dict(poller.poll(timeout=500)):
+                        continue
                     msg = self.server_socket.recv_multipart()
                     if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
                         self._handle_aux_data(msg)
@@ -584,9 +601,52 @@ class MoriKVManager(CommonKVManager):
                             bootstrap_room,
                         )
                 except Exception:
+                    if self._stopped:
+                        break
                     logger.exception("Decode status worker failed")
 
-        threading.Thread(target=decode_worker, daemon=True).start()
+        _t = threading.Thread(target=decode_worker, daemon=True)
+        _t.start()
+        self._worker_threads.append(_t)
+
+    def teardown(self) -> None:
+        """Stop worker threads and release transport resources so this
+        KVManager can be discarded during a P<->D role switch (PoC).
+        The KV cache pool memory is owned by the scheduler and is NOT freed.
+        """
+        self._stopped = True
+        for _t in self._worker_threads:
+            _t.join(timeout=3.0)
+        self._worker_threads = []
+        try:
+            self.server_socket.close(linger=0)
+        except Exception:
+            logger.exception("Failed to close mori server_socket during teardown")
+        try:
+            self._zmq_ctx.destroy(linger=0)
+        except Exception:
+            logger.exception("Failed to destroy mori zmq context during teardown")
+        try:
+            for descs in (self.kv_mem_descs, self.aux_mem_descs):
+                for desc in descs:
+                    try:
+                        self.engine.deregister_memory(desc)
+                    except Exception:
+                        pass
+            for component_descs in self.state_mem_descs:
+                for desc in component_descs:
+                    try:
+                        self.engine.deregister_memory(desc)
+                    except Exception:
+                        pass
+        finally:
+            self.kv_mem_descs = []
+            self.aux_mem_descs = []
+            self.state_mem_descs = []
+            self.engine = None
+        logger.info(
+            "MoriKVManager torn down (was role=%s)", self.disaggregation_mode.value
+        )
 
     def _compute_prefill_unique_rank(self) -> int:
         """Unique id per prefill sender, encoding TP/PP/CP ranks.

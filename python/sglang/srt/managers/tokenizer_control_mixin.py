@@ -63,6 +63,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    PdRoleSwitchReqInput,
+    PdRoleSwitchReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -101,6 +103,7 @@ _COMMUNICATOR_SPECS = [
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
+    ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
@@ -784,6 +787,38 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def pd_role_switch(
+        self: TokenizerManager,
+        obj: PdRoleSwitchReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> PdRoleSwitchReqOutput:
+        self.auto_create_handle_loop()
+        if not self.server_args.enable_pd_role_switch:
+            return PdRoleSwitchReqOutput(
+                success=False,
+                message="--enable-pd-role-switch is not set on this server",
+                old_role=self.server_args.disaggregation_mode,
+                new_role=obj.new_role,
+            )
+        results = await self.pd_role_switch_communicator(obj)
+        all_success = all(r.success for r in results)
+        all_flipped = bool(results) and all(getattr(r, "flipped", False) for r in results)
+        # Only advance the tokenizer-manager's cached role once every rank has
+        # actually flipped (graceful/migrate drains flip asynchronously later).
+        if all_flipped:
+            self.server_args.disaggregation_mode = obj.new_role
+        msg = "; ".join(f"dp{i}:{r.message}" for i, r in enumerate(results))
+        return PdRoleSwitchReqOutput(
+            success=all_success,
+            message=msg,
+            old_role=results[0].old_role if results else "",
+            new_role=obj.new_role,
+            flipped=all_flipped,
+            drained=bool(results) and all(getattr(r, "drained", False) for r in results),
+            migrated=sum(getattr(r, "migrated", 0) for r in results),
+            aborted=sum(getattr(r, "aborted", 0) for r in results),
+        )
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()

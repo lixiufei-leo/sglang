@@ -137,6 +137,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    PdRoleSwitchReqInput,
+    PdRoleSwitchReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
@@ -898,6 +900,11 @@ class Scheduler(
             )
 
     def init_running_status(self):
+        # Set by a runtime PD role switch to break out of the current event loop.
+        self._event_loop_should_restart = False
+        # (new_role, drain_policy, migrate_url) while a graceful/migrate
+        # role-switch drain is in progress; None otherwise.
+        self._pd_switch_pending = None
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
@@ -1034,6 +1041,20 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
+        # Sub-components cache disaggregation_mode at construction. During a
+        # runtime P<->D role switch they already exist, so propagate the new
+        # mode to keep them consistent (no-op at first __init__ call).
+        for _comp_name in (
+            "invariant_checker",
+            "load_inquirer",
+            "output_streamer",
+            "batch_result_processor",
+        ):
+            _comp = getattr(self, _comp_name, None)
+            if _comp is not None and hasattr(_comp, "disaggregation_mode"):
+                object.__setattr__(
+                    _comp, "disaggregation_mode", self.disaggregation_mode
+                )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool, model_config = kv_cache_builder.get_draft_kv_pool(
@@ -1335,6 +1356,7 @@ class Scheduler(
                     self.weight_updater.check_weights,
                 ),
                 (SlowDownReqInput, self.slow_down),
+                (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
                     ProfileReq,
                     lambda req: self.profiler_manager._profile(req),
@@ -1560,6 +1582,17 @@ class Scheduler(
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+        # If a graceful/migrate role-switch drain is in progress, complete it
+        # once the instance has drained to idle (this sets the restart flag).
+        self._maybe_complete_pending_switch()
+
+        # A runtime PD role switch rebuilt the disaggregation structures for a
+        # new role. The response was already sent; break out of the current
+        # (old-role) event loop so the supervisor can re-dispatch.
+        if getattr(self, "_event_loop_should_restart", False):
+            self._event_loop_should_restart = False
+            raise _PdRoleSwitchRestart()
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
@@ -2165,6 +2198,20 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if getattr(self, "_pd_switch_pending", None) is not None and not is_retracted:
+            # A role-switch drain is in progress: refuse new work so the
+            # instance can reach idle. Bounce with a retryable status so
+            # the router/client re-routes elsewhere.
+            abort_req = AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": "Instance is draining for a PD role switch; please retry.",
+                },
+                rid=req.rid,
+            )
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            return
         if not self._set_or_validate_priority(req):
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -3847,6 +3894,400 @@ class Scheduler(
         self.forward_sleep_time = t
         return SlowDownReqOutput()
 
+    def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
+        """(PoC) Flip this instance's disaggregation role at runtime.
+
+        The instance must be fully idle (drained). The token KV pool is role
+        independent and is NOT reallocated; only the role-specific disaggregation
+        structures are torn down and rebuilt via init_disaggregation()."""
+        old_role = self.disaggregation_mode.value
+        new_role = (recv_req.new_role or "").lower()
+
+        def _fail(msg):
+            logger.warning(
+                "PD role switch rejected (%s -> %s): %s", old_role, new_role, msg
+            )
+            return PdRoleSwitchReqOutput(
+                success=False, message=msg, old_role=old_role, new_role=new_role
+            )
+
+        try:
+            if not self.server_args.enable_pd_role_switch:
+                return _fail("--enable-pd-role-switch is not set on this instance")
+            if new_role not in ("prefill", "decode"):
+                return _fail(f"invalid new_role={recv_req.new_role!r}")
+            if self.disaggregation_mode == DisaggregationMode.NULL:
+                return _fail("instance is not running in PD disaggregation mode")
+            if new_role == old_role:
+                return PdRoleSwitchReqOutput(
+                    success=True,
+                    message="already in target role",
+                    old_role=old_role,
+                    new_role=new_role,
+                )
+            drain_policy = (getattr(recv_req, "drain_policy", "") or "reject").lower()
+            migrate_url = getattr(recv_req, "migrate_url", "") or ""
+            if drain_policy not in ("reject", "graceful", "migrate", "migrate_kv"):
+                return _fail(f"invalid drain_policy={drain_policy!r}")
+            if getattr(self, "_pd_switch_pending", None) is not None:
+                return _fail("a role switch drain is already in progress")
+
+            # Already idle -> flip right away, regardless of policy.
+            if self.is_fully_idle():
+                self._do_flip(new_role)
+                return PdRoleSwitchReqOutput(
+                    success=True, message="ok", old_role=old_role,
+                    new_role=new_role, flipped=True, drained=True,
+                )
+
+            if drain_policy == "reject":
+                return _fail(
+                    "instance is not idle; drain all requests before switching"
+                )
+
+            if drain_policy == "graceful":
+                # Stop accepting new work; let in-flight finish, then flip.
+                self._pd_switch_pending = (new_role, "graceful", "")
+                logger.info(
+                    "PD role switch scheduled (graceful drain): %s -> %s",
+                    old_role, new_role,
+                )
+                return PdRoleSwitchReqOutput(
+                    success=True,
+                    message="draining (graceful); will flip when idle",
+                    old_role=old_role, new_role=new_role,
+                    flipped=False, drained=False,
+                )
+
+            if drain_policy == "migrate_kv":
+                # True D->D KV migration: ship existing KV to the target decode
+                # node (migrate_url), no re-prefill, then force-drain and flip.
+                migrated, aborted = self._migrate_kv_inflight_decode(migrate_url)
+                self._pd_switch_pending = (new_role, "migrate_kv", migrate_url)
+                logger.info(
+                    "PD role switch scheduled (migrate_kv): %s -> %s migrated=%d aborted=%d",
+                    old_role, new_role, migrated, aborted,
+                )
+                return PdRoleSwitchReqOutput(
+                    success=True,
+                    message=f"kv-migrated {migrated}, aborted {aborted}; flipping when drained",
+                    old_role=old_role, new_role=new_role,
+                    flipped=False, migrated=migrated, aborted=aborted,
+                )
+
+            # drain_policy == "migrate": move in-flight decode reqs elsewhere,
+            # force-drain, then flip near-immediately.
+            migrated, aborted = self._migrate_inflight_decode(migrate_url)
+            self._pd_switch_pending = (new_role, "migrate", migrate_url)
+            logger.info(
+                "PD role switch scheduled (migrate): %s -> %s migrated=%d aborted=%d",
+                old_role, new_role, migrated, aborted,
+            )
+            return PdRoleSwitchReqOutput(
+                success=True,
+                message=f"migrated {migrated}, aborted {aborted}; flipping when drained",
+                old_role=old_role, new_role=new_role,
+                flipped=False, migrated=migrated, aborted=aborted,
+            )
+        except Exception as e:
+            logger.exception("PD role switch failed")
+            return _fail(f"role switch raised: {e}")
+
+    def _ensure_kv_exporter(self):
+        """Lazily build a PREFILL-mode exporter (a PrefillBootstrapQueue over this
+        node's own token_to_kv_pool) so a decode node can SEND existing KV during
+        a migrate_kv role switch. Registers to this node's bootstrap server."""
+        q = getattr(self, "_kv_exporter", None)
+        if q is not None:
+            return q
+        from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
+
+        q = PrefillBootstrapQueue(
+            token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+            draft_token_to_kv_pool=None,
+            req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+            metadata_buffers=self.disagg_metadata_buffers,
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            gpu_id=self.ps.gpu_id,
+            bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+            gloo_group=self.attn_tp_cpu_group,
+            max_total_num_tokens=self.max_total_num_tokens,
+            scheduler=self,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            transfer_backend=self.transfer_backend,
+        )
+        self._kv_exporter = q
+        logger.info("KV migration exporter ready (PREFILL sender over shared KV pool)")
+        return q
+
+    def _kv_migration_local_ip(self):
+        import socket
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return socket.gethostbyname(socket.gethostname())
+
+    def _export_one_req_kv(self, q, req, room, src_ip):
+        """Ship req's existing KV to the target as a prefill handoff for `room`.
+        Mirrors normal PD: send KV for the first M-1 tokens + last token via aux.
+        Returns True on KVPoll.Success."""
+        import time as _time
+        from array import array as _array
+
+        import numpy as _np
+
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.mem_cache.common import kv_to_page_indices
+
+        full = list(req.origin_input_ids) + list(req.output_ids)
+        M = len(full)
+        if M < 2:
+            return False
+        # Represent the sequence as: prompt=full[:M-1], one "sampled" token=full[M-1].
+        req.origin_input_ids = full[: M - 1]
+        req.output_ids = _array("q", [full[M - 1]])
+        req.bootstrap_host = src_ip
+        req.bootstrap_room = room
+        req.bootstrap_port = q.bootstrap_port
+        req.start_send_idx = 0
+        req.metadata_buffer_index = -1
+        req.pending_bootstrap = False
+        req.disagg_kv_sender = None
+
+        num_kv_heads = self.model_config.get_num_kv_heads(self.ps.tp_size)
+        if not q.create_sender(req, num_kv_heads):
+            return False
+        if not q.finalize_bootstrap(req):
+            return False
+
+        # Send KV for the first M-1 tokens (aux carries full[M-1]).
+        page_size = self.token_to_kv_pool_allocator.page_size
+        end_idx = len(req.origin_input_ids)
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[req.req_pool_idx, 0:end_idx]
+            .cpu()
+            .numpy()
+        )
+        q.metadata_buffers.set_buf(req)
+        page_indices = kv_to_page_indices(kv_indices, page_size)
+
+        # Mirror the normal prefill flow: the sender must reach WaitingForInput
+        # (target receiver connected + sent its dst kv_indices) BEFORE we push
+        # the KV. Sending immediately after init() races the handshake and fails.
+        deadline = 60
+        sent = False
+        t0 = _time.monotonic()
+        while _time.monotonic() - t0 < deadline:
+            st = req.disagg_kv_sender.poll()
+            if st == KVPoll.Failed:
+                logger.warning("KV migration send failed for room=%s", room)
+                return False
+            if st == KVPoll.Success:
+                return sent
+            if st == KVPoll.WaitingForInput and not sent:
+                req.disagg_kv_sender.send(page_indices, None)
+                sent = True
+            _time.sleep(0.02)
+        logger.warning("KV migration send timed out for room=%s (sent=%s)", room, sent)
+        return False
+
+    def _migrate_kv_inflight_decode(self, target_url):
+        """Ship each actively-decoding request's KV to target_url (another decode
+        node) and have it resume there without re-prefill. Returns (migrated,
+        aborted). Requests not yet decoding are aborted (retryable)."""
+        import json as _json
+        import threading as _threading
+        import urllib.request as _url
+
+        migrated = 0
+        aborted = 0
+        if not target_url:
+            logger.warning("migrate_kv: no target_url; falling back to abort-only")
+        else:
+            src_ip = self._kv_migration_local_ip()
+            q = self._ensure_kv_exporter()
+            reqs = list(self.running_batch.reqs) if self.running_batch is not None else []
+            room_base = int(getattr(self, "_kv_mig_room", 700000000))
+            for i, req in enumerate(reqs):
+                if req.finished():
+                    continue
+                full = list(req.origin_input_ids) + list(req.output_ids)
+                if len(full) < 2:
+                    aborted += 1
+                    continue
+                max_new = getattr(req.sampling_params, "max_new_tokens", 0) or 0
+                remaining = max(1, int(max_new) - len(req.output_ids))
+                room = room_base + i
+                # Post the resume request to the target FIRST so its receiver is
+                # waiting, then drive the send.
+                body = _json.dumps({
+                    "input_ids": full[: len(full) - 1],
+                    "sampling_params": {"max_new_tokens": int(remaining), "temperature": 0},
+                    "bootstrap_host": src_ip,
+                    "bootstrap_port": int(q.bootstrap_port),
+                    "bootstrap_room": int(room),
+                    "stream": False,
+                }).encode()
+
+                def _post(b=body):
+                    try:
+                        r = _url.Request(target_url.rstrip("/") + "/generate", data=b,
+                                         headers={"Content-Type": "application/json"}, method="POST")
+                        _url.urlopen(r, timeout=120)
+                    except Exception:
+                        logger.exception("migrate_kv: target /generate failed")
+
+                th = _threading.Thread(target=_post, daemon=True)
+                th.start()
+                if self._export_one_req_kv(q, req, room, src_ip):
+                    migrated += 1
+                else:
+                    aborted += 1
+            self._kv_mig_room = room_base + len(reqs) + 1
+
+        # Count not-yet-decoding reqs (aborted by abort_all below).
+        not_started = len(self.waiting_queue)
+        pq = getattr(self, "disagg_decode_prealloc_queue", None)
+        if pq is not None:
+            not_started += len(pq.queue) + len(pq.retracted_queue)
+        tq = getattr(self, "disagg_decode_transfer_queue", None)
+        if tq is not None:
+            not_started += len(tq.queue)
+        aborted += not_started
+        from sglang.srt.managers.io_struct import AbortReq
+
+        self.abort_request(AbortReq(abort_all=True))
+        return migrated, aborted
+
+    def _do_flip(self, new_role: str):
+        """Tear down current-role disagg structures and rebuild for new_role.
+        Signals the event-loop supervisor to re-dispatch."""
+        old_role = self.disaggregation_mode.value
+        self._teardown_disaggregation()
+        self.server_args.disaggregation_mode = new_role
+        self.init_disaggregation()
+        self._event_loop_should_restart = True
+        logger.info("PD role switch flip done: %s -> %s", old_role, new_role)
+
+    def _maybe_complete_pending_switch(self):
+        """If a graceful/migrate drain is pending and the instance has drained
+        to idle, perform the flip. Called once per event-loop iteration."""
+        pending = getattr(self, "_pd_switch_pending", None)
+        if pending is None:
+            return
+        if not self.is_fully_idle():
+            return
+        new_role, policy, _migrate_url = pending
+        self._pd_switch_pending = None
+        logger.info(
+            "PD role switch: drained (policy=%s); flipping -> %s", policy, new_role
+        )
+        self._do_flip(new_role)
+
+    def _resubmit_request(self, migrate_url: str, input_ids, max_new_tokens: int) -> bool:
+        """POST a token-level continuation to migrate_url/generate. Best-effort."""
+        import json
+        import urllib.request
+
+        url = migrate_url.rstrip("/") + "/generate"
+        body = json.dumps(
+            {
+                "input_ids": list(input_ids),
+                "sampling_params": {"max_new_tokens": int(max_new_tokens)},
+                "stream": False,
+            }
+        ).encode()
+        try:
+            r = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            urllib.request.urlopen(r, timeout=15)
+            return True
+        except Exception:
+            logger.exception("migrate resubmit failed to %s", url)
+            return False
+
+    def _migrate_inflight_decode(self, migrate_url: str):
+        """Migrate in-flight decode requests to another node, then force-drain
+        this instance so it can flip to prefill without waiting for the decode
+        long tail (PoC). Returns (migrated, aborted).
+
+        Running (already decoding) reqs are re-submitted token-level as
+        prompt = origin_input_ids + output_ids so the target re-prefills and
+        continues them. Not-yet-decoding reqs (prealloc/transfer/waiting) are
+        aborted (retryable) — their original request can be replayed.
+        """
+        migrated = 0
+        aborted = 0
+        snapshots = []
+        reqs = list(self.running_batch.reqs) if self.running_batch is not None else []
+        for req in reqs:
+            if req.finished():
+                continue
+            try:
+                input_ids = list(req.origin_input_ids) + list(req.output_ids)
+                max_new = getattr(req.sampling_params, "max_new_tokens", 0) or 0
+                remaining = max(1, int(max_new) - len(req.output_ids))
+                snapshots.append((req.rid, input_ids, remaining))
+            except Exception:
+                logger.exception("failed to snapshot decode req for migration")
+        if migrate_url:
+            for _rid, input_ids, remaining in snapshots:
+                if self._resubmit_request(migrate_url, input_ids, remaining):
+                    migrated += 1
+                else:
+                    aborted += 1
+        else:
+            logger.warning(
+                "migrate: no migrate_url given; aborting %d running reqs",
+                len(snapshots),
+            )
+            aborted += len(snapshots)
+        # Count not-yet-decoding reqs (will be aborted by abort_all below).
+        not_started = len(self.waiting_queue)
+        q = getattr(self, "disagg_decode_prealloc_queue", None)
+        if q is not None:
+            not_started += len(q.queue) + len(q.retracted_queue)
+        tq = getattr(self, "disagg_decode_transfer_queue", None)
+        if tq is not None:
+            not_started += len(tq.queue)
+        aborted += not_started
+        # Force-drain everything locally: running reqs -> to_finish (one more
+        # forward pass then cleanup), queued reqs released immediately.
+        self.abort_request(AbortReq(abort_all=True))
+        return migrated, aborted
+
+    def _teardown_disaggregation(self):
+        """Release the current role's disaggregation structures so the other
+        role can be rebuilt. Used by runtime P<->D role switching (PoC)."""
+        mode = self.disaggregation_mode
+        if mode == DisaggregationMode.PREFILL:
+            q = getattr(self, "disagg_prefill_bootstrap_queue", None)
+            if q is not None:
+                km = getattr(q, "kv_manager", None)
+                if km is not None and hasattr(km, "teardown"):
+                    km.teardown()
+                self.disagg_prefill_bootstrap_queue = None
+            self.disagg_prefill_inflight_queue = []
+        elif mode == DisaggregationMode.DECODE:
+            q = getattr(self, "disagg_decode_prealloc_queue", None)
+            if q is not None:
+                km = getattr(q, "kv_manager", None)
+                if km is not None and hasattr(km, "teardown"):
+                    km.teardown()
+                self.disagg_decode_prealloc_queue = None
+            self.disagg_decode_transfer_queue = None
+        self.disagg_metadata_buffers = None
+        self.req_to_metadata_buffer_idx_allocator = None
+
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
@@ -3912,7 +4353,27 @@ class Scheduler(
         pass
 
 
+class _PdRoleSwitchRestart(Exception):
+    """Internal signal: break out of the current disaggregation event loop so
+    the supervisor can re-dispatch after a runtime P<->D role switch."""
+
+
 def dispatch_event_loop(scheduler: Scheduler):
+    # Supervisor: a runtime PD role switch breaks out of the active event loop
+    # by raising _PdRoleSwitchRestart; we then re-dispatch to the new role.
+    while True:
+        try:
+            _dispatch_event_loop_once(scheduler)
+            return
+        except _PdRoleSwitchRestart:
+            logger.info(
+                "Re-dispatching event loop after PD role switch -> %s",
+                scheduler.disaggregation_mode.value,
+            )
+            continue
+
+
+def _dispatch_event_loop_once(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode

@@ -230,12 +230,11 @@ class SchedulerInvariantChecker:
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
 
     def _check_req_pool(self):
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            req_total_size = (
-                self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
-            )
-        else:
-            req_total_size = self.req_to_token_pool.size
+        # Account for pre-alloc headroom whenever the pool has it (decode pool,
+        # or a role-switch prefill instance holding a decode-flavored pool).
+        req_total_size = self.req_to_token_pool.size + getattr(
+            self.req_to_token_pool, "pre_alloc_size", 0
+        )
 
         session_req_count = self.pool_stats_observer.session_held_req_count()
         if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:

@@ -133,6 +133,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    PdRoleSwitchReqInput,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -1348,6 +1349,26 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
         await _global_state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.api_route("/pd_role_switch", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pd_role_switch(obj: PdRoleSwitchReqInput, request: Request):
+    """(PoC) Switch this instance PD role at runtime. Must be idle. Needs
+    --enable-pd-role-switch."""
+    try:
+        result = await _global_state.tokenizer_manager.pd_role_switch(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        {
+            "success": result.success,
+            "message": result.message,
+            "old_role": result.old_role,
+            "new_role": result.new_role,
+        },
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
