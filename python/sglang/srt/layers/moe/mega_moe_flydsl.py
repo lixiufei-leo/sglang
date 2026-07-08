@@ -385,6 +385,17 @@ def _run_mega_routed(
     y = mega.forward_bf16(x_in, topk_weights, topk_ids)
     y = y[:num_tokens]
 
-    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+    # routed_scaling_factor must be applied EXACTLY once. On AMD the router uses
+    # aiter_biased_grouped_topk, which folds routed_scaling_factor into each
+    # routed topk weight; the reference DeepSeek forward paths therefore skip the
+    # post-MoE multiply whenever _use_aiter (guard `not (should_fuse or
+    # _use_aiter)`). should_fuse_routed_scaling_factor_in_topk is False for quark,
+    # so guarding on it alone double-applied RSF here (routed came out RSF x too
+    # large -> gsm8k 0.41 vs 0.97 fixed). Mirror the reference guard.
+    try:
+        from sglang.srt.models.deepseek_common.utils import _use_aiter
+    except Exception:  # noqa: BLE001
+        _use_aiter = True  # this FlyDSL MegaMoE path is AMD-only; aiter folds RSF
+    if not (moe.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter):
         y.mul_(moe.routed_scaling_factor)
     return y
