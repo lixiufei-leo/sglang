@@ -182,11 +182,26 @@ def build_mega_moe_experts_weights(layer) -> None:
     hidden = layer.w13_weight.shape[2] * 2  # packed fp4 -> 2 values/byte
     inter = layer.w2_weight.shape[2] * 2
 
+    # Scale attribute naming differs by quant method: quark (R1) registers
+    # ``w13_weight_scale``; sglang's Fp8MoEMethod fp4-experts path (DeepSeek V4)
+    # registers ``w13_weight_scale_inv``. Both hold the same e8m0 per-1x32 scale
+    # (uint8, [E, rows, K//32]), so resolve whichever exists.
+    def _scale_of(s_attr):
+        s = getattr(layer, s_attr, None)
+        if s is None:
+            s = getattr(layer, s_attr + "_inv", None)
+        if s is None:
+            raise AttributeError(
+                f"MegaMoE build: neither {s_attr} nor {s_attr}_inv on layer "
+                f"(have: {[n for n in vars(layer) if 'scale' in n]})"
+            )
+        return s.data
+
     layer._mega_w1, layer._mega_w1_scale = _requant_shuffle(
-        layer.w13_weight.data, layer.w13_weight_scale.data
+        layer.w13_weight.data, _scale_of("w13_weight_scale")
     )
     layer._mega_w2, layer._mega_w2_scale = _requant_shuffle(
-        layer.w2_weight.data, layer.w2_weight_scale.data
+        layer.w2_weight.data, _scale_of("w2_weight_scale")
     )
     dev = layer.w13_weight.device
 
