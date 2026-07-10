@@ -124,14 +124,28 @@ def _ensure_mori_shmem() -> None:
 
     group_name = "megamoe_flydsl"
     cpu_group = get_moe_ep_group().cpu_group
+    # Register the named c10d PG if absent. IMPORTANT: PG registration and mori's
+    # symmetric-heap init are INDEPENDENT. In PD-disaggregation the PG can already
+    # be registered (or mori.io, used for KV transfer, brought up the mori runtime)
+    # while the MegaMoE symmetric heap was NEVER allocated -- observed as
+    # "[shmem] Pointer ... not in symmetric heap [0x0, 0x0)" -> NULL-deref GPU fault
+    # in FlyDSL stage1. The old code SKIPPED shmem init when the PG pre-existed,
+    # which is wrong. So register-if-needed, then ALWAYS init the shmem heap.
     try:
         torch._C._distributed_c10d._register_process_group(group_name, cpu_group)
     except Exception as e:  # noqa: BLE001
         if "already registered" not in str(e):
             raise
-        # Group already registered (e.g. re-entry): shmem was initialized too.
-    else:
-        mori.shmem.shmem_torch_process_group_init(group_name)
+    mori.shmem.shmem_torch_process_group_init(group_name)
+    try:
+        logger.info(
+            "FlyDSL MegaMoE mori shmem init: group=%s mype=%s npes=%s",
+            group_name,
+            mori.shmem.shmem_mype(),
+            mori.shmem.shmem_npes(),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     _MORI_SHMEM_READY = True
 
 
