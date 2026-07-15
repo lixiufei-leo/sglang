@@ -884,6 +884,10 @@ class Envs:
     # Directory of the FlyDSL workspace that provides `kernels.mega_moe`. Falls
     # back to $ATOM_FLYDSL_KERNELS_PATH when empty.
     SGLANG_AMD_FLYDSL_KERNELS_PATH = EnvStr("")
+    # Force the FlyDSL MegaMoE activation/weight quant ("a4w4" = fp4 acts, "a8w4"
+    # = fp8 acts). Empty = defer to the per-layer `_mega_quant` set at weight
+    # build (a8w4 for quark w4a8 / R1, a4w4 for w4a4), falling back to a8w4.
+    SGLANG_AMD_FLYDSL_MEGA_QUANT = EnvStr("")
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

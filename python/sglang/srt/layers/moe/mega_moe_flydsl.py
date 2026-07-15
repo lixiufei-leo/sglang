@@ -81,6 +81,46 @@ def _ensure_flydsl_on_path() -> None:
     _FLYDSL_PATH_READY = True
 
 
+def _import_flydsl():
+    """Lazily import the FlyDSL MegaMoE kernel + weight-prep helpers.
+
+    Single entry point for the whole FlyDSL-workspace dependency so the coupling
+    is contained and documented in one place (rather than scattered imports):
+      * ``kernels.mega_moe.MegaMoE`` -- the fused MegaMoE op (FlyDSL ``kernels/``).
+      * ``per_1x32_fp4_quant`` / ``fp4_utils`` / ``shuffle_weight`` -- the MXFP4
+        quant + weight-shuffle helpers used at weight build. These currently live
+        under the FlyDSL repo's ``tests/`` tree; ROCm/FlyDSL does not yet expose
+        them via the ``flydsl`` package, so we import them from the workspace made
+        importable by _ensure_flydsl_on_path(). TODO: switch to a public
+        ``flydsl.*`` API once FlyDSL promotes these out of ``tests/``.
+
+    Imported here (not at module top) so a stock sglang install without the
+    FlyDSL workspace stays unaffected; raises a clear error if unavailable.
+    """
+    _ensure_flydsl_on_path()
+    try:
+        from kernels.mega_moe import MegaMoE
+        from tests.kernels.test_moe_gemm import _per_1x32_fp4_quant
+        from tests.kernels.utils import fp4_utils
+        from tests.utils import shuffle_weight
+    except ImportError as exc:  # pragma: no cover - depends on external workspace
+        raise ImportError(
+            "FlyDSL MegaMoE backend requires the FlyDSL workspace on PYTHONPATH "
+            "(kernels.mega_moe + the tests/ MXFP4 weight-prep helpers). Set "
+            "SGLANG_AMD_FLYDSL_KERNELS_PATH (or $ATOM_FLYDSL_KERNELS_PATH) to the "
+            f"FlyDSL checkout. Original import error: {exc}"
+        ) from exc
+
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        MegaMoE=MegaMoE,
+        per_1x32_fp4_quant=_per_1x32_fp4_quant,
+        fp4_utils=fp4_utils,
+        shuffle_weight=shuffle_weight,
+    )
+
+
 def _mtpr() -> int:
     mtpr = int(envs.SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.get())
     if mtpr & (mtpr - 1) != 0:
@@ -164,10 +204,10 @@ def build_mega_moe_experts_weights(layer) -> None:
     if getattr(layer, "_mega_moe_weights_built", False):
         return
 
-    _ensure_flydsl_on_path()
-    from tests.kernels.test_moe_gemm import _per_1x32_fp4_quant  # FlyDSL quantizer
-    from tests.kernels.utils import fp4_utils  # noqa: E402  FlyDSL repo
-    from tests.utils import shuffle_weight  # noqa: E402  FlyDSL repo (NOT aiter)
+    _fd = _import_flydsl()
+    _per_1x32_fp4_quant = _fd.per_1x32_fp4_quant
+    fp4_utils = _fd.fp4_utils
+    shuffle_weight = _fd.shuffle_weight  # FlyDSL layout (NOT aiter)
 
     fp4_view = torch.float4_e2m1fn_x2
 
@@ -246,9 +286,8 @@ def _get_or_build_mega_moe(
     quant: str = "a8w4",
 ):
     """Return the shared MegaMoE, building it once from ``layer``'s weights."""
-    _ensure_flydsl_on_path()
     _ensure_mori_shmem()
-    from kernels.mega_moe import MegaMoE  # noqa: E402  FlyDSL repo
+    MegaMoE = _import_flydsl().MegaMoE
 
     rank, world = _ep_rank_world()
     mtpr = _mtpr()
@@ -403,7 +442,7 @@ def _run_mega_routed(
         # differs), so SGLANG_AMD_FLYDSL_MEGA_QUANT can force a8w4 (fp8 acts) on
         # an a4w4 checkpoint to isolate fused-kernel accuracy from weight-conv.
         quant=(
-            os.environ.get("SGLANG_AMD_FLYDSL_MEGA_QUANT")
+            envs.SGLANG_AMD_FLYDSL_MEGA_QUANT.get()
             or getattr(moe.experts, "_mega_quant", "a8w4")
         ),
     )
