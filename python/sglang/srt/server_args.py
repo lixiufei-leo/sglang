@@ -3807,7 +3807,14 @@ class ServerArgs:
                 )
         if not self.dcp_size > 1:
             return
+        if self.tp_size % self.dcp_size != 0:
+            raise ValueError(
+                "Decode context parallel requires --dcp-size to divide "
+                f"--tp-size, but got dcp_size={self.dcp_size}, "
+                f"tp_size={self.tp_size}."
+            )
         if is_hip():
+            self._handle_dsv4_dcp_validation()
             return
         elif is_cuda():
             if self.speculative_algorithm is not None:
@@ -3846,6 +3853,57 @@ class ServerArgs:
                 "--decode-context-parallel-size > 1) is currently only "
                 f"supported on the AMD HIP platform, but got dcp_size="
                 f"{self.dcp_size} on a non-HIP platform."
+            )
+
+    def _handle_dsv4_dcp_validation(self):
+        """Fail fast on DeepSeek-V4 DCP configurations that would silently
+        misbehave.
+
+        The V4 decode-CP path is implemented entirely on the HIP unified_kv
+        backend (deepseek_v4_backend_hip_radix._decode_dcp) and is driven by
+        environment variables rather than server args, so a typo or a missing
+        companion flag otherwise degrades into wrong numbers instead of an
+        error.
+        """
+        import os
+
+        def _on(name: str, default: str = "0") -> bool:
+            return os.environ.get(name, default) not in ("0", "", "false", "False")
+
+        if self.attention_backend != "dsv4":
+            return
+
+        if os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND") != "unified_kv_triton":
+            raise ValueError(
+                "DeepSeek-V4 decode context parallel (--dcp-size > 1 with "
+                "--attention-backend dsv4) is only implemented on the "
+                "unified_kv path; set SGLANG_HACK_FLASHMLA_BACKEND="
+                "unified_kv_triton. Got "
+                f"{os.environ.get('SGLANG_HACK_FLASHMLA_BACKEND')!r}."
+            )
+
+        physical = _on("SGLANG_DSV4_DCP_PHYSICAL")
+        if physical and self.disaggregation_mode != "null":
+            # Only the mori backend implements the owner filter + row remap that
+            # a sharded decode pool needs (mori/conn.py::_dcp_scatter). Any other
+            # transfer backend would write full-layout rows into a 1/dcp buffer.
+            if self.disaggregation_transfer_backend != "mori":
+                raise ValueError(
+                    "SGLANG_DSV4_DCP_PHYSICAL=1 shards the decode KV pool, so "
+                    "the PD transfer layer must scatter rows to their owning "
+                    "decode rank. Only --disaggregation-transfer-backend mori "
+                    "implements this; got "
+                    f"{self.disaggregation_transfer_backend!r}."
+                )
+
+        if _on("SGLANG_DSV4_DCP_INDEXER_SCORING") and _on(
+            "SGLANG_DSV4_DCP_INDEXER_TOPK"
+        ):
+            raise ValueError(
+                "SGLANG_DSV4_DCP_INDEXER_SCORING already shards the top-k "
+                "selection (it selects over this rank's candidate shard), so "
+                "SGLANG_DSV4_DCP_INDEXER_TOPK must not also be set -- the two "
+                "would shard the candidate axis twice."
             )
 
     def _handle_load_balance_method(self):
