@@ -173,7 +173,9 @@ def compact_dcp_streams(
     # Same idiom as runtime._lengths_to_indptr, but written into a persistent
     # buffer instead of allocating (F.pad would allocate on every step).
     out_indptr[0] = 0
-    torch.cumsum(out_len, dim=0, dtype=out_indptr.dtype, out=out_indptr[1:])
+    # NB: do not pass dtype= together with out= -- some torch builds reject the
+    # combination. out_len and out_indptr already share indptr's dtype.
+    torch.cumsum(out_len, dim=0, out=out_indptr[1:])
     _compact_kernel[grid](
         indices,
         indptr,
