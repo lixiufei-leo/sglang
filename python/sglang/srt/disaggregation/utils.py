@@ -1040,6 +1040,22 @@ def setup_state_kv_args(
                 )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
+            if getattr(token_to_kv_pool, "_unified_kv", False):
+                # Physical DCP geometry, needed by the prefill side to scatter
+                # the compressed rows to their owning decode rank. Carried on
+                # kv_args because the KV managers never see the pool itself.
+                # dcp_size == 1 means "not sharded" -> every path is a no-op.
+                kv_args.dcp_size = (
+                    int(getattr(token_to_kv_pool, "unified_dcp_size", 1))
+                    if getattr(token_to_kv_pool, "unified_physical_dcp", False)
+                    else 1
+                )
+                kv_args.dcp_rank = int(
+                    getattr(token_to_kv_pool, "unified_dcp_rank", 0)
+                )
+                kv_args.dcp_swa_pages = int(
+                    getattr(token_to_kv_pool, "unified_swa_pages", 0)
+                )
             if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
                 token_to_kv_pool, "get_unified_swa_ring_buf_infos"
             ):

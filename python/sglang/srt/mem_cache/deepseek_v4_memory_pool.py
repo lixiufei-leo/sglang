@@ -641,8 +641,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.unified_swa_window = self.sliding_window
             self.unified_swa_ring_size = self.sliding_window + spec_extra
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
-            # Physical-DCP knobs surfaced for the attention backend.
+            # Physical-DCP knobs surfaced for the attention backend and for the
+            # PD transfer layer (which must scatter compressed rows to the
+            # owning decode rank; see mori/conn.py::_dcp_scatter).
             self.unified_physical_dcp = self.unified_kv_pool.physical_dcp
+            self.unified_dcp_size = self.unified_kv_pool.dcp_size
+            self.unified_dcp_rank = self.unified_kv_pool.dcp_rank
             self.unified_compress_dead_row = self.unified_kv_pool.compress_dead_row
         else:
             self.unified_kv_pool = None

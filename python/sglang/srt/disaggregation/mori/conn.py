@@ -191,6 +191,13 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    # DeepSeek-V4 unified_kv physical DCP: the decode pool stores only its
+    # 1/dcp shard of the COMPRESSED rows, so the prefill side must scatter.
+    # dcp_size == 1 (the default, and what any older decode peer reports)
+    # means "not sharded" and every code path below is a no-op.
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    dcp_swa_pages: int = 0
 
     @property
     def engine_key(self) -> str:
@@ -218,6 +225,10 @@ class KVArgsRegisterInfo:
             if len(payload) > 12 and payload[12]
             else []
         )
+        # Optional trailer; absent when the decode peer predates physical DCP.
+        dcp_size = int(payload[13].decode("ascii")) if len(payload) > 13 else 1
+        dcp_rank = int(payload[14].decode("ascii")) if len(payload) > 14 else 0
+        dcp_swa_pages = int(payload[15].decode("ascii")) if len(payload) > 15 else 0
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -228,6 +239,9 @@ class KVArgsRegisterInfo:
             gpu_id=gpu_id,
             decode_tp_size=decode_tp_size,
             decode_tp_rank=decode_tp_rank,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            dcp_swa_pages=dcp_swa_pages,
             dst_kv_item_len=dst_kv_item_len,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
@@ -867,12 +881,59 @@ class MoriKVManager(CommonKVManager):
             sizes=sizes,
         )
 
+    @staticmethod
+    def _dcp_scatter(
+        peer_info: KVArgsRegisterInfo,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+    ) -> Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+        """Keep only the rows this decode rank owns, and remap them to its shard.
+
+        Under DeepSeek-V4 unified_kv physical DCP the decode buffer is laid out
+        as ``[ swa_pages (replicated) | ceil(compress/dcp) | DEAD ]`` and the
+        owner of a compressed row is ``(slot - swa_pages) % dcp``. Prefill runs
+        TP with a full (replicated) MLA KV on every rank, so every prefill rank
+        can serve every decode rank directly -- no all-to-all, just a filter and
+        an index remap, mirroring ``_dcp_row_owner(PHYSICAL=True)``.
+
+        The SWA region ``[0, swa_pages)`` is replicated on the decode side and
+        is passed through untouched (it is normally shipped separately as
+        StateType.SWA_RING; handled here too so the mapping stays total).
+
+        No-op when the peer reports ``dcp_size == 1``.
+        """
+        dcp = peer_info.dcp_size
+        if dcp <= 1 or dst_kv_indices.size == 0:
+            return prefill_kv_indices, dst_kv_indices
+
+        swa_pages = peer_info.dcp_swa_pages
+        rank = peer_info.dcp_rank
+        dst = dst_kv_indices.astype(np.int64)
+
+        is_swa = dst < swa_pages
+        page = dst - swa_pages
+        owned = is_swa | ((page % dcp) == rank)
+        if not owned.any():
+            empty = np.empty(0, dtype=dst_kv_indices.dtype)
+            return empty, empty
+
+        local = np.where(is_swa, dst, swa_pages + page // dcp)
+        return (
+            prefill_kv_indices[owned],
+            local[owned].astype(dst_kv_indices.dtype),
+        )
+
     def send_kvcache(
         self,
         peer_info: KVArgsRegisterInfo,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
     ) -> List[TransferStatus]:
+        prefill_kv_indices, dst_kv_indices = self._dcp_scatter(
+            peer_info, prefill_kv_indices, dst_kv_indices
+        )
+        if dst_kv_indices.size == 0:
+            return []
         grouped_plan = GroupedIndexPlan.from_groups(
             *group_concurrent_contiguous(
                 prefill_kv_indices,
@@ -1676,6 +1737,10 @@ class MoriKVReceiver(CommonKVReceiver):
         packed_state_dim_per_tensor = pack_int_lists(
             self.kv_mgr.kv_args.state_dim_per_tensor, "I"
         )
+        _ka = self.kv_mgr.kv_args
+        dcp_size = str(getattr(_ka, "dcp_size", 1)).encode("ascii")
+        dcp_rank = str(getattr(_ka, "dcp_rank", 0)).encode("ascii")
+        dcp_swa_pages = str(getattr(_ka, "dcp_swa_pages", 0)).encode("ascii")
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1697,6 +1762,9 @@ class MoriKVReceiver(CommonKVReceiver):
                             kv_item_len,
                             packed_state_item_lens,
                             packed_state_dim_per_tensor,
+                            dcp_size,
+                            dcp_rank,
+                            dcp_swa_pages,
                         ]
                     )
             except zmq.ZMQError:
