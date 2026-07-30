@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -83,6 +84,22 @@ def _create_dummy_paged_compress_data(compress_ratio: int):
 
 
 @dataclass
+def _dcp_compact_streams_enabled() -> bool:
+    """Opt-in metadata-side owner filtering + compaction of the DCP streams.
+
+    Default ON when DCP is active: it is a strict improvement over in-kernel
+    masking (same result, less kernel work). The env var exists so the two can
+    be A/B'd and so it can be turned off if a shape hits a Triton edge case.
+    """
+    return os.environ.get("SGLANG_DSV4_DCP_COMPACT", "1") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+
+
+
 class UnifiedKvMetadata:
     """
     unified-kv per-forward metadata
@@ -1220,6 +1237,31 @@ class DeepseekV4HipRadixBackend(
         pool = self.token_to_kv_pool
         physical = getattr(pool, "unified_physical_dcp", False)
         swa_pages = getattr(pool, "unified_swa_pages", 0) if physical else 0
+
+        if _dcp_compact_streams_enabled():
+            # Filter + compact on the metadata side so each row is physically
+            # 1/dcp long: this cuts the decode kernel's ITERATION count, not just
+            # its loads (the in-kernel _dcp_row_owner mask only predicates the
+            # loads off, so the K loop still walks every entry). The compaction
+            # also applies the PHYSICAL row remap, so the kernel below runs
+            # DCP-unaware (dcp_size=1) over a plain local stream.
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.dcp_compact import (
+                compact_dcp_streams,
+            )
+
+            kv_indices, kv_indptr = compact_dcp_streams(
+                kv_indices,
+                kv_indptr,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+                physical=physical,
+                swa_pages=swa_pages,
+            )
+            k_dcp_size, k_dcp_rank, k_physical, k_swa_pages = 1, 0, False, 0
+        else:
+            k_dcp_size, k_dcp_rank = self.dcp_size, self.dcp_rank
+            k_physical, k_swa_pages = physical, swa_pages
+
         out_shard, lse_shard = runtime.decode(
             q=q_full,
             unified_kv=unified,
@@ -1229,10 +1271,10 @@ class DeepseekV4HipRadixBackend(
             softmax_scale=self.softmax_scale,
             apply_sink=False,
             return_lse=True,
-            dcp_size=self.dcp_size,
-            dcp_rank=self.dcp_rank,
-            physical=physical,
-            swa_pages=swa_pages,
+            dcp_size=k_dcp_size,
+            dcp_rank=k_dcp_rank,
+            physical=k_physical,
+            swa_pages=k_swa_pages,
         )
         o_nosink, global_lse = cp_lse_ag_out_rs(
             out_shard, lse_shard, dcp_group, return_lse=True
