@@ -79,27 +79,45 @@ def _create_flashmla_metadata():
     return flash_mla.get_mla_metadata()[0]
 
 
+# Below this many total stream entries, compaction costs more than it saves.
+# Measured on MI355X (dcp/evidence/02-gpu-validation-report.md, P1 vs P2): the
+# compaction pass is a flat ~45-56 us regardless of size, while the kernel time
+# it removes scales with the stream. Net effect vs total entries (T x row_len):
+#     16384 -> -0.043 ms    65536 -> -0.003 ms
+#    131072 -> +0.045 ms   262144 -> +0.111 ms   2097152 -> +1.228 ms
+# Break-even sits at ~65536, so gate one doubling above it.
+_DCP_COMPACT_MIN_ENTRIES = int(
+    os.environ.get("SGLANG_DSV4_DCP_COMPACT_MIN", "131072")
+)
+
+
+def _dcp_compact_streams_enabled(kv_indices: torch.Tensor) -> bool:
+    """Whether to owner-filter + compact this decode stream on the host side.
+
+    Compaction is a strict accuracy no-op (verified: it agrees with the
+    in-kernel mask path to the last bit) and a large win on long streams --
+    in-kernel masking only predicates the loads off, so the K loop still runs
+    and it buys ~4%, while compaction cuts the iteration count and measures
+    5-6x. But it is a fixed ~50 us, so on short streams it is a pure loss.
+
+    The gate reads ``kv_indices.numel()``, i.e. the ALLOCATED buffer size
+    (N * (win + csa_width)), which is a host-side static shape -- not a
+    data-dependent quantity. That keeps the branch identical between HIP-graph
+    capture and replay; gating on the true per-step length would not.
+    """
+    v = os.environ.get("SGLANG_DSV4_DCP_COMPACT", "auto")
+    if v in ("0", "", "false", "False"):
+        return False
+    if v == "auto":
+        return kv_indices.numel() >= _DCP_COMPACT_MIN_ENTRIES
+    return True
+
+
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
 
 
 @dataclass
-def _dcp_compact_streams_enabled() -> bool:
-    """Opt-in metadata-side owner filtering + compaction of the DCP streams.
-
-    Default ON when DCP is active: it is a strict improvement over in-kernel
-    masking (same result, less kernel work). The env var exists so the two can
-    be A/B'd and so it can be turned off if a shape hits a Triton edge case.
-    """
-    return os.environ.get("SGLANG_DSV4_DCP_COMPACT", "1") not in (
-        "0",
-        "",
-        "false",
-        "False",
-    )
-
-
-
 class UnifiedKvMetadata:
     """
     unified-kv per-forward metadata
@@ -1238,7 +1256,7 @@ class DeepseekV4HipRadixBackend(
         physical = getattr(pool, "unified_physical_dcp", False)
         swa_pages = getattr(pool, "unified_swa_pages", 0) if physical else 0
 
-        if _dcp_compact_streams_enabled():
+        if _dcp_compact_streams_enabled(kv_indices):
             # Filter + compact on the metadata side so each row is physically
             # 1/dcp long: this cuts the decode kernel's ITERATION count, not just
             # its loads (the in-kernel _dcp_row_owner mask only predicates the
