@@ -1137,6 +1137,13 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            # NOTE(rebase of #29185): the PR patched
+            # model_executor/model_runner_kv_cache_mixin.py::_init_pools, which
+            # upstream moved into this configurator. get_parallel() is the
+            # canonical source in current main (ModelRunner.dcp_size/dcp_rank
+            # mirror it: model_runner.py:266-267).
+            dcp_size=get_parallel().dcp_size,
+            dcp_rank=get_parallel().dcp_rank,
         )
         return token_to_kv_pool
 
