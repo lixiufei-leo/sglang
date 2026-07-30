@@ -2113,11 +2113,30 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            max_total_num_tokens=self._reported_max_total_num_tokens(),
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
+
+    def _reported_max_total_num_tokens(self) -> int:
+        """Pool capacity to report, accounting for decode context parallel.
+
+        Under DCP the KV is sharded across the group, so the aggregate capacity
+        is dcp_size x the per-rank pool -- EXCEPT for DeepSeek-V4, whose
+        allocator runs the SWA branch over an unsharded page_size and whose
+        unified_kv pool only shards when SGLANG_DSV4_DCP_PHYSICAL is set. With
+        read-only DCP (the default) the pool is still fully replicated, so
+        scaling here would over-report capacity by dcp_size and poison every
+        utilisation / hit-rate metric derived from it.
+        """
+        dcp = self.server_args.dcp_size
+        if dcp <= 1:
+            return self.max_total_num_tokens
+        if self.server_args.attention_backend == "dsv4":
+            pool = getattr(self, "token_to_kv_pool", None)
+            if not getattr(pool, "unified_physical_dcp", False):
+                return self.max_total_num_tokens
+        return self.max_total_num_tokens * dcp
 
     def init_invariant_checker(self) -> None:
         self.invariant_checker = SchedulerInvariantChecker(
