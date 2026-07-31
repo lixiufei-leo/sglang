@@ -51,7 +51,7 @@ class DeepSeekV4PrefillCostModel:
     first travels from storage to the host cache and then from host to device.
     """
 
-    SPEC_VERSION = 1
+    SPEC_VERSION = 2
 
     def __init__(
         self,
@@ -60,13 +60,14 @@ class DeepSeekV4PrefillCostModel:
         num_hidden_layers: int,
         num_csa_layers: int,
         num_hca_layers: int,
+        num_swa_only_layers: int,
         qk_head_dim: int,
         v_head_dim: int,
         index_n_heads: int,
         index_head_dim: int,
         index_topk: int,
         window_size: int,
-        kv_lora_rank: int,
+        kv_cache_bytes_per_slot: int,
         attn_tp_size: int,
         attention_tflops_per_gpu: float,
         h2d_bandwidth_gbps: float,
@@ -82,18 +83,19 @@ class DeepSeekV4PrefillCostModel:
             "index_head_dim": index_head_dim,
             "index_topk": index_topk,
             "window_size": window_size,
-            "kv_lora_rank": kv_lora_rank,
+            "kv_cache_bytes_per_slot": kv_cache_bytes_per_slot,
             "attn_tp_size": attn_tp_size,
         }
         for name, value in positive_ints.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
-        if num_csa_layers < 0 or num_hca_layers < 0:
+        if min(num_csa_layers, num_hca_layers, num_swa_only_layers) < 0:
             raise ValueError("DSV4 layer counts cannot be negative")
-        if num_csa_layers + num_hca_layers != num_hidden_layers:
+        if num_csa_layers + num_hca_layers + num_swa_only_layers != num_hidden_layers:
             raise ValueError(
                 "DSV4 compression ratios must cover every attention layer: "
-                f"{num_csa_layers=} + {num_hca_layers=} != {num_hidden_layers=}"
+                f"{num_csa_layers=} + {num_hca_layers=} + "
+                f"{num_swa_only_layers=} != {num_hidden_layers=}"
             )
         for name, value in (
             ("attention_tflops_per_gpu", attention_tflops_per_gpu),
@@ -107,13 +109,14 @@ class DeepSeekV4PrefillCostModel:
         self.num_hidden_layers = num_hidden_layers
         self.num_csa_layers = num_csa_layers
         self.num_hca_layers = num_hca_layers
+        self.num_swa_only_layers = num_swa_only_layers
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
         self.window_size = window_size
-        self.kv_lora_rank = kv_lora_rank
+        self.kv_cache_bytes_per_slot = kv_cache_bytes_per_slot
         self.attn_tp_size = attn_tp_size
         self.attention_tflops_per_gpu = attention_tflops_per_gpu
         self.h2d_bandwidth_gbps = h2d_bandwidth_gbps
@@ -121,16 +124,18 @@ class DeepSeekV4PrefillCostModel:
         self.fp4_indexer = fp4_indexer
 
     @classmethod
-    def from_hf_config(
+    def from_model_config(
         cls,
-        hf_config: Any,
+        model_config: Any,
         *,
         attn_tp_size: int,
         attention_tflops_per_gpu: float,
         h2d_bandwidth_gbps: float,
         storage_bandwidth_gbps: float,
         fp4_indexer: bool = False,
+        unified_kv: bool = False,
     ) -> DeepSeekV4PrefillCostModel:
+        hf_config = model_config.hf_text_config
         if not is_deepseek_v4(hf_config):
             architectures = getattr(hf_config, "architectures", None)
             raise ValueError(
@@ -138,27 +143,48 @@ class DeepSeekV4PrefillCostModel:
                 f"DeepSeek-V4, got architectures={architectures}"
             )
 
-        compression_ratios = tuple(int(r) for r in hf_config.compress_ratios)
-        unsupported = sorted(set(compression_ratios) - {4, 128})
+        num_hidden_layers = int(model_config.num_hidden_layers)
+        all_compression_ratios = tuple(int(r) for r in model_config.compress_ratios)
+        if len(all_compression_ratios) < num_hidden_layers:
+            raise ValueError(
+                "DSV4 compression ratios do not cover every attention layer: "
+                f"{len(all_compression_ratios)} < {num_hidden_layers}"
+            )
+        compression_ratios = all_compression_ratios[:num_hidden_layers]
+        unsupported = sorted(set(compression_ratios) - {0, 4, 128})
         if unsupported:
             raise ValueError(
-                "DSV4 cost model supports compression ratios 4 and 128, "
+                "DSV4 cost model supports compression ratios 0, 4, and 128, "
                 f"got unsupported ratios {unsupported}"
             )
 
+        qk_head_dim = int(model_config.head_dim)
+        qk_rope_head_dim = int(model_config.qk_rope_head_dim)
+        qk_nope_head_dim = qk_head_dim - qk_rope_head_dim
+        if qk_nope_head_dim <= 0:
+            raise ValueError(
+                "DSV4 qk_rope_head_dim must be smaller than head_dim, "
+                f"got {qk_rope_head_dim=} and {qk_head_dim=}"
+            )
+        kv_cache_bytes_per_slot = (
+            2 * qk_head_dim
+            if unified_kv
+            else (qk_nope_head_dim + 2 * qk_rope_head_dim + qk_nope_head_dim // 64 + 1)
+        )
+
         return cls(
-            num_attention_heads=int(hf_config.num_attention_heads),
-            num_hidden_layers=int(hf_config.num_hidden_layers),
+            num_attention_heads=int(model_config.num_attention_heads),
+            num_hidden_layers=num_hidden_layers,
             num_csa_layers=compression_ratios.count(4),
             num_hca_layers=compression_ratios.count(128),
-            qk_head_dim=int(hf_config.qk_nope_head_dim)
-            + int(hf_config.qk_rope_head_dim),
-            v_head_dim=int(hf_config.v_head_dim),
+            num_swa_only_layers=compression_ratios.count(0),
+            qk_head_dim=qk_head_dim,
+            v_head_dim=int(model_config.v_head_dim),
             index_n_heads=int(hf_config.index_n_heads),
             index_head_dim=int(hf_config.index_head_dim),
             index_topk=int(hf_config.index_topk),
-            window_size=int(hf_config.window_size),
-            kv_lora_rank=int(hf_config.kv_lora_rank),
+            window_size=int(model_config.window_size),
+            kv_cache_bytes_per_slot=kv_cache_bytes_per_slot,
             attn_tp_size=attn_tp_size,
             attention_tflops_per_gpu=attention_tflops_per_gpu,
             h2d_bandwidth_gbps=h2d_bandwidth_gbps,
@@ -174,13 +200,14 @@ class DeepSeekV4PrefillCostModel:
             "num_hidden_layers": self.num_hidden_layers,
             "num_csa_layers": self.num_csa_layers,
             "num_hca_layers": self.num_hca_layers,
+            "num_swa_only_layers": self.num_swa_only_layers,
             "qk_head_dim": self.qk_head_dim,
             "v_head_dim": self.v_head_dim,
             "index_n_heads": self.index_n_heads,
             "index_head_dim": self.index_head_dim,
             "index_topk": self.index_topk,
             "window_size": self.window_size,
-            "kv_lora_rank": self.kv_lora_rank,
+            "kv_cache_bytes_per_slot": self.kv_cache_bytes_per_slot,
             "attn_tp_size": self.attn_tp_size,
             "attention_tflops_per_gpu": self.attention_tflops_per_gpu,
             "h2d_bandwidth_gbps": self.h2d_bandwidth_gbps,
@@ -229,19 +256,20 @@ class DeepSeekV4PrefillCostModel:
     def full_cache_bytes_per_input_token(self) -> float:
         """Logical HiCache bytes represented by one original input token.
 
-        DSV4 stores one 2*kv_lora_rank compressed KV item per c4/c128 slot.
-        CSA also stores one quantized index vector plus a four-byte scale.
+        DSV4 stores one packed KV item per c4/c128 slot. The item is
+        584 bytes in the separate FP8/BF16 layout and 1024 bytes in the
+        unified BF16 layout. CSA also stores one quantized index vector plus
+        a four-byte scale.
         """
-        compressed_kv_bytes = 2 * self.kv_lora_rank
         index_bytes = self.index_head_dim / (2 if self.fp4_indexer else 1) + 4
         return (
-            self.num_csa_layers * (compressed_kv_bytes + index_bytes) / 4
-            + self.num_hca_layers * compressed_kv_bytes / 128
+            self.num_csa_layers * (self.kv_cache_bytes_per_slot + index_bytes) / 4
+            + self.num_hca_layers * self.kv_cache_bytes_per_slot / 128
         )
 
     @property
     def swa_cache_bytes_per_input_token(self) -> int:
-        return self.num_hidden_layers * 2 * self.kv_lora_rank
+        return self.num_hidden_layers * self.kv_cache_bytes_per_slot
 
     def estimate(
         self,

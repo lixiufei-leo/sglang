@@ -20,7 +20,7 @@ import signal
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 import psutil
 import setproctitle
@@ -31,12 +31,15 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.dp_cost_model import (
     DeepSeekV4PrefillCostModel,
 )
+from sglang.srt.managers.dp_prefix_cache import DPPrefixCacheTracker
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ClearHiCacheReqInput,
     ElasticScaleUpdateReq,
+    FlushCacheReqInput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -122,7 +125,9 @@ class DPBudget:
         *,
         estimated_tokens: int = 0,
         estimated_cost_s: float = 0.0,
+        estimated_costs_s: Sequence[float] | None = None,
     ):
+        selected_cost_s = estimated_cost_s
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
@@ -132,17 +137,28 @@ class DPBudget:
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
         elif method == LoadBalanceMethod.COST_AWARE:
+            if estimated_costs_s is None:
+                estimated_costs_s = [estimated_cost_s] * self.dp_size
+            if len(estimated_costs_s) != self.dp_size:
+                raise ValueError(
+                    "Rank-specific costs must match dp_size: "
+                    f"{len(estimated_costs_s)} != {self.dp_size}"
+                )
             target_rank = min(
                 range(self.dp_size),
-                key=lambda i: (self.prefill_cost[i], self.total_requests[i]),
+                key=lambda i: (
+                    self.prefill_cost[i] + estimated_costs_s[i],
+                    self.total_requests[i],
+                ),
             )
+            selected_cost_s = estimated_costs_s[target_rank]
         else:
             return None
 
         # Keep speculative load until a newer scheduler snapshot arrives.
         self.total_requests[target_rank] += 1
         self.total_tokens[target_rank] += estimated_tokens
-        self.prefill_cost[target_rank] += estimated_cost_s
+        self.prefill_cost[target_rank] += selected_cost_s
         return target_rank
 
 
@@ -211,6 +227,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.dp_cost_model_spec = None
+        self.dp_prefix_cache = None
         self.workers: List[Optional[zmq.Socket]] = [None] * self.max_dp_size
         self.status: List[bool] = list(self.dp_active)
         self._active_workers: List[int] = list(range(self.launch_dp_size))
@@ -239,6 +256,32 @@ class DataParallelController:
             self.dp_cost_model = DeepSeekV4PrefillCostModel.from_spec(
                 self.dp_cost_model_spec
             )
+            page_size = server_args.page_size
+            device_pages = max(1, self.max_total_num_tokens // page_size)
+            host_pages = 0
+            if server_args.enable_hierarchical_cache:
+                if server_args.hicache_size > 0:
+                    bytes_per_token = (
+                        self.dp_cost_model.full_cache_bytes_per_input_token
+                        + self.dp_cost_model.swa_cache_bytes_per_input_token
+                    )
+                    host_tokens = int(server_args.hicache_size * 1e9 / bytes_per_token)
+                    host_pages = max(1, host_tokens // page_size)
+                else:
+                    host_pages = max(1, int(device_pages * server_args.hicache_ratio))
+            storage_pages = (
+                host_pages if server_args.hicache_storage_backend is not None else 0
+            )
+            self.dp_prefix_cache = DPPrefixCacheTracker(
+                dp_size=server_args.dp_size,
+                page_size=page_size,
+                device_pages_per_rank=device_pages,
+                host_pages_per_rank=host_pages,
+                storage_pages_per_rank=storage_pages,
+                host_write_through=(
+                    server_args.hicache_write_policy == "write_through"
+                ),
+            )
 
         self.init_dispatcher()
 
@@ -258,6 +301,10 @@ class DataParallelController:
                 sock_send(worker, obj)
 
     def send_control_message(self, obj):
+        if self.dp_prefix_cache is not None and isinstance(
+            obj, (FlushCacheReqInput, ClearHiCacheReqInput)
+        ):
+            self.dp_prefix_cache.clear()
         for i in self._active_workers[:: self.control_message_step]:
             worker = self.workers[i]
             if worker is not None:
@@ -836,16 +883,53 @@ class DataParallelController:
         )
         sock_send(self.workers[target_worker], req)
 
+    @staticmethod
+    def _prefix_cache_namespace(req: Req) -> bytes:
+        return repr(
+            (
+                getattr(req, "lora_id", None),
+                getattr(req, "extra_key", None),
+            )
+        ).encode()
+
     def cost_aware_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
+            assert self.dp_prefix_cache is not None
+            self.dp_prefix_cache.insert(
+                req.routed_dp_rank,
+                req.input_ids,
+                namespace=self._prefix_cache_namespace(req),
+            )
             return
         assert self.dp_cost_model is not None
-        estimated_cost_s = self.dp_cost_model.estimate(
-            input_tokens=len(req.input_ids)
-        ).total_seconds
+        assert self.dp_prefix_cache is not None
+        input_tokens = len(req.input_ids)
+        namespace = self._prefix_cache_namespace(req)
+        rank_hits = self.dp_prefix_cache.estimate(
+            req.input_ids,
+            namespace=namespace,
+        )
+        estimated_costs_s = [
+            self.dp_cost_model.estimate(
+                input_tokens=input_tokens,
+                cached_context_tokens=hit.cached_context_tokens,
+                host_cache_tokens=hit.host_transfer_tokens,
+                storage_cache_tokens=hit.storage_tokens,
+                swa_host_cache_tokens=min(
+                    hit.host_transfer_tokens,
+                    self.dp_cost_model.window_size,
+                ),
+            ).total_seconds
+            for hit in rank_hits
+        ]
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.COST_AWARE,
-            estimated_cost_s=estimated_cost_s,
+            estimated_costs_s=estimated_costs_s,
+        )
+        self.dp_prefix_cache.insert(
+            target_worker,
+            req.input_ids,
+            namespace=namespace,
         )
         sock_send(self.workers[target_worker], req)
 

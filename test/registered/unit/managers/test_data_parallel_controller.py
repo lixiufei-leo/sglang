@@ -13,7 +13,7 @@ is exercised as the real method, no mock.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import msgspec.structs
 
@@ -27,6 +27,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DPBudget,
     LoadBalanceMethod,
 )
+from sglang.srt.managers.dp_prefix_cache import PrefixCacheHitEstimate
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -53,6 +54,11 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl.dp_budget = DPBudget(dp_size=dp_size)
     ctl.dp_cost_model = MagicMock()
     ctl.dp_cost_model.estimate.return_value = SimpleNamespace(total_seconds=0.25)
+    ctl.dp_cost_model.window_size = 8
+    ctl.dp_prefix_cache = MagicMock()
+    ctl.dp_prefix_cache.estimate.return_value = [
+        PrefixCacheHitEstimate() for _ in range(dp_size)
+    ]
     return ctl
 
 
@@ -182,6 +188,18 @@ class TestDPBudgetDispatch(CustomTestCase):
         self.assertAlmostEqual(budget.prefill_cost[1], 0.15)
         self.assertEqual(budget.total_requests[1], 1)
 
+    def test_cost_aware_compares_queue_plus_rank_specific_request_cost(self):
+        budget = DPBudget(dp_size=3)
+        budget.prefill_cost = [0.0, 0.05, 0.2]
+        budget.total_requests = [0, 0, 0]
+        rank = budget.dispatch(
+            LoadBalanceMethod.COST_AWARE,
+            estimated_costs_s=[0.1, 0.01, 0.01],
+        )
+        self.assertEqual(rank, 1)
+        self.assertAlmostEqual(budget.prefill_cost[1], 0.06)
+        self.assertEqual(budget.total_requests[1], 1)
+
     def test_dispatch_returns_none_for_methods_not_handled(self):
         """Round-robin and follow_bootstrap_room dispatch elsewhere; DPBudget
         only handles the load-aware variants."""
@@ -287,23 +305,58 @@ class TestTotalRequestsScheduler(CustomTestCase):
 
 
 class TestCostAwareScheduler(CustomTestCase):
-    def test_dispatches_to_min_cost_worker_and_adds_request_estimate(self):
+    def test_dispatches_to_min_projected_cost_and_records_prefix(self):
         ctl = _make_controller(dp_size=3)
         ctl.dp_budget.prefill_cost = [0.4, 0.1, 0.2]
-        ctl.cost_aware_scheduler(_req(input_ids=list(range(128))))
+        req = _req(input_ids=list(range(128)))
+        ctl.cost_aware_scheduler(req)
 
         ctl.workers[1].send_pyobj.assert_called_once()
         self.assertAlmostEqual(ctl.dp_budget.prefill_cost[1], 0.35)
-        ctl.dp_cost_model.estimate.assert_called_once_with(input_tokens=128)
+        expected_call = call(
+            input_tokens=128,
+            cached_context_tokens=0,
+            host_cache_tokens=0,
+            storage_cache_tokens=0,
+            swa_host_cache_tokens=0,
+        )
+        self.assertEqual(
+            ctl.dp_cost_model.estimate.call_args_list,
+            [expected_call, expected_call, expected_call],
+        )
+        ctl.dp_prefix_cache.insert.assert_called_once()
+        self.assertEqual(ctl.dp_prefix_cache.insert.call_args.args[0], 1)
+        self.assertIs(ctl.dp_prefix_cache.insert.call_args.args[1], req.input_ids)
+
+    def test_rank_cache_hit_can_outweigh_a_small_queue_difference(self):
+        ctl = _make_controller(dp_size=3)
+        ctl.dp_budget.prefill_cost = [0.0, 0.05, 1.0]
+        ctl.dp_prefix_cache.estimate.return_value = [
+            PrefixCacheHitEstimate(),
+            PrefixCacheHitEstimate(device_tokens=96),
+            PrefixCacheHitEstimate(),
+        ]
+        ctl.dp_cost_model.estimate.side_effect = lambda **kwargs: SimpleNamespace(
+            total_seconds=(0.01 if kwargs["cached_context_tokens"] == 96 else 0.1)
+        )
+
+        ctl.cost_aware_scheduler(_req(input_ids=list(range(128))))
+
+        ctl.workers[1].send_pyobj.assert_called_once()
+        self.assertAlmostEqual(ctl.dp_budget.prefill_cost[1], 0.06)
 
     def test_routed_dp_rank_bypasses_cost_model_and_budget(self):
         ctl = _make_controller(dp_size=3)
         ctl.dp_budget.prefill_cost = [0.4, 0.1, 0.2]
-        ctl.cost_aware_scheduler(_req(routed_dp_rank=0, input_ids=[1, 2]))
+        req = _req(routed_dp_rank=0, input_ids=[1, 2])
+        ctl.cost_aware_scheduler(req)
 
         ctl.workers[0].send_pyobj.assert_called_once()
         ctl.dp_cost_model.estimate.assert_not_called()
         self.assertEqual(ctl.dp_budget.prefill_cost, [0.4, 0.1, 0.2])
+        ctl.dp_prefix_cache.insert.assert_called_once()
+        self.assertEqual(ctl.dp_prefix_cache.insert.call_args.args[0], 0)
+        self.assertIs(ctl.dp_prefix_cache.insert.call_args.args[1], req.input_ids)
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):

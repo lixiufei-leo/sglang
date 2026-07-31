@@ -1998,8 +1998,12 @@ class Scheduler(
         self._prev_decode_launch_ts: Optional[float] = None
         prefill_cost_model = None
         if self.server_args.load_balance_method == "cost_aware":
-            prefill_cost_model = DeepSeekV4PrefillCostModel.from_hf_config(
-                self.model_config.hf_text_config,
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+                is_unified_kv_triton,
+            )
+
+            prefill_cost_model = DeepSeekV4PrefillCostModel.from_model_config(
+                self.model_config,
                 attn_tp_size=self.ps.attn_tp_size,
                 attention_tflops_per_gpu=self.server_args.dp_cost_attention_tflops,
                 h2d_bandwidth_gbps=self.server_args.dp_cost_h2d_bandwidth_gbps,
@@ -2007,6 +2011,7 @@ class Scheduler(
                     self.server_args.dp_cost_storage_bandwidth_gbps
                 ),
                 fp4_indexer=self.server_args.enable_deepseek_v4_fp4_indexer,
+                unified_kv=is_unified_kv_triton(),
             )
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,

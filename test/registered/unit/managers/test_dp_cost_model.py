@@ -8,21 +8,30 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _hf_config():
+def _model_config():
     return SimpleNamespace(
-        architectures=["DeepseekV4ForCausalLM"],
-        compress_ratios=[4, 4, 128, 128],
+        hf_text_config=SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"],
+            index_n_heads=4,
+            index_head_dim=128,
+            index_topk=16,
+            kv_lora_rank=512,
+        ),
+        compress_ratios=[4, 4, 128, 128, 0],
         num_attention_heads=8,
         num_hidden_layers=4,
-        qk_nope_head_dim=448,
+        head_dim=512,
         qk_rope_head_dim=64,
         v_head_dim=512,
-        index_n_heads=4,
-        index_head_dim=128,
-        index_topk=16,
         window_size=8,
-        kv_lora_rank=512,
     )
+
+
+def _model_config_with_swa_only_layer():
+    config = _model_config()
+    config.compress_ratios = [4, 128, 0]
+    config.num_hidden_layers = 3
+    return config
 
 
 def _model(**overrides):
@@ -33,7 +42,7 @@ def _model(**overrides):
         "storage_bandwidth_gbps": 25.0,
     }
     kwargs.update(overrides)
-    return DeepSeekV4PrefillCostModel.from_hf_config(_hf_config(), **kwargs)
+    return DeepSeekV4PrefillCostModel.from_model_config(_model_config(), **kwargs)
 
 
 class TestDeepSeekV4PrefillCostModel(CustomTestCase):
@@ -41,10 +50,39 @@ class TestDeepSeekV4PrefillCostModel(CustomTestCase):
         model = _model()
         self.assertEqual(model.num_csa_layers, 2)
         self.assertEqual(model.num_hca_layers, 2)
+        self.assertEqual(model.num_swa_only_layers, 0)
         self.assertEqual(model.qk_head_dim, 512)
+        self.assertEqual(model.kv_cache_bytes_per_slot, 584)
 
         restored = DeepSeekV4PrefillCostModel.from_spec(model.to_spec())
         self.assertEqual(restored.to_spec(), model.to_spec())
+
+    def test_supports_swa_only_layer_and_ignores_nextn_padding(self):
+        model = DeepSeekV4PrefillCostModel.from_model_config(
+            _model_config_with_swa_only_layer(),
+            attn_tp_size=2,
+            attention_tflops_per_gpu=1000.0,
+            h2d_bandwidth_gbps=100.0,
+            storage_bandwidth_gbps=25.0,
+        )
+        self.assertEqual(model.num_csa_layers, 1)
+        self.assertEqual(model.num_hca_layers, 1)
+        self.assertEqual(model.num_swa_only_layers, 1)
+        self.assertGreater(
+            model.estimate(input_tokens=64).swa_attention_seconds,
+            0,
+        )
+
+    def test_cache_bytes_match_separate_and_unified_layouts(self):
+        separate = _model()
+        unified = _model(unified_kv=True)
+
+        self.assertEqual(separate.kv_cache_bytes_per_slot, 584)
+        self.assertEqual(unified.kv_cache_bytes_per_slot, 1024)
+        self.assertEqual(separate.full_cache_bytes_per_input_token, 367.125)
+        self.assertEqual(unified.full_cache_bytes_per_input_token, 594.0)
+        self.assertEqual(separate.swa_cache_bytes_per_input_token, 2336)
+        self.assertEqual(unified.swa_cache_bytes_per_input_token, 4096)
 
     def test_all_attention_components_are_modeled(self):
         estimate = _model().estimate(input_tokens=64)
@@ -113,10 +151,10 @@ class TestDeepSeekV4PrefillCostModel(CustomTestCase):
         self.assertEqual(window.h2d_seconds, beyond_window.h2d_seconds)
 
     def test_rejects_non_dsv4_config(self):
-        config = _hf_config()
-        config.architectures = ["DeepseekV3ForCausalLM"]
+        config = _model_config()
+        config.hf_text_config.architectures = ["DeepseekV3ForCausalLM"]
         with self.assertRaisesRegex(ValueError, "supports only DeepSeek-V4"):
-            DeepSeekV4PrefillCostModel.from_hf_config(
+            DeepSeekV4PrefillCostModel.from_model_config(
                 config,
                 attn_tp_size=1,
                 attention_tflops_per_gpu=1000.0,
