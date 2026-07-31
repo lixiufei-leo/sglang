@@ -887,40 +887,17 @@ class MoriKVManager(CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
     ) -> Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
-        """Keep only the rows this decode rank owns, and remap them to its shard.
+        """See disaggregation.dcp_scatter.dcp_scatter. Kept as a method so the
+        call site reads naturally; the mapping itself lives in a transport-free
+        module so it can be tested without standing up mori."""
+        from sglang.srt.disaggregation.dcp_scatter import dcp_scatter
 
-        Under DeepSeek-V4 unified_kv physical DCP the decode buffer is laid out
-        as ``[ swa_pages (replicated) | ceil(compress/dcp) | DEAD ]`` and the
-        owner of a compressed row is ``(slot - swa_pages) % dcp``. Prefill runs
-        TP with a full (replicated) MLA KV on every rank, so every prefill rank
-        can serve every decode rank directly -- no all-to-all, just a filter and
-        an index remap, mirroring ``_dcp_row_owner(PHYSICAL=True)``.
-
-        The SWA region ``[0, swa_pages)`` is replicated on the decode side and
-        is passed through untouched (it is normally shipped separately as
-        StateType.SWA_RING; handled here too so the mapping stays total).
-
-        No-op when the peer reports ``dcp_size == 1``.
-        """
-        dcp = peer_info.dcp_size
-        if dcp <= 1 or dst_kv_indices.size == 0:
-            return prefill_kv_indices, dst_kv_indices
-
-        swa_pages = peer_info.dcp_swa_pages
-        rank = peer_info.dcp_rank
-        dst = dst_kv_indices.astype(np.int64)
-
-        is_swa = dst < swa_pages
-        page = dst - swa_pages
-        owned = is_swa | ((page % dcp) == rank)
-        if not owned.any():
-            empty = np.empty(0, dtype=dst_kv_indices.dtype)
-            return empty, empty
-
-        local = np.where(is_swa, dst, swa_pages + page // dcp)
-        return (
-            prefill_kv_indices[owned],
-            local[owned].astype(dst_kv_indices.dtype),
+        return dcp_scatter(
+            peer_info.dcp_size,
+            peer_info.dcp_rank,
+            peer_info.dcp_swa_pages,
+            prefill_kv_indices,
+            dst_kv_indices,
         )
 
     def send_kvcache(
