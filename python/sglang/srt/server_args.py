@@ -1020,10 +1020,26 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "cost_aware",
             ],
         ),
         NS("parallel"),
     ] = "auto"
+    dp_cost_attention_tflops: A[
+        float,
+        "Effective DeepSeek-V4 attention throughput per GPU, in TFLOP/s, used by cost-aware DP dispatch.",
+        NS("parallel"),
+    ] = 1000.0
+    dp_cost_h2d_bandwidth_gbps: A[
+        float,
+        "Effective host-to-device HiCache load-back bandwidth, in GB/s, used by cost-aware DP dispatch.",
+        NS("parallel"),
+    ] = 100.0
+    dp_cost_storage_bandwidth_gbps: A[
+        float,
+        "Effective storage-to-host HiCache prefetch bandwidth, in GB/s, used by cost-aware DP dispatch.",
+        NS("parallel"),
+    ] = 25.0
     attn_cp_size: A[
         int,
         Arg(
@@ -3853,6 +3869,18 @@ class ServerArgs:
             raise ValueError(
                 f"Invalid disaggregation_mode={self.disaggregation_mode!r}"
             )
+
+        if self.load_balance_method == "cost_aware":
+            for name, value in (
+                ("dp_cost_attention_tflops", self.dp_cost_attention_tflops),
+                ("dp_cost_h2d_bandwidth_gbps", self.dp_cost_h2d_bandwidth_gbps),
+                (
+                    "dp_cost_storage_bandwidth_gbps",
+                    self.dp_cost_storage_bandwidth_gbps,
+                ),
+            ):
+                if value <= 0:
+                    raise ValueError(f"--{name.replace('_', '-')} must be positive")
 
         if self.load_balance_method == "auto":
             # Default behavior:

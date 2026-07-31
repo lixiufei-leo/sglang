@@ -100,6 +100,7 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+from sglang.srt.managers.dp_cost_model import DeepSeekV4PrefillCostModel
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1563,6 +1564,10 @@ class Scheduler(
             "max_req_input_len": self.max_req_input_len,
         }
 
+        if self.load_inquirer.prefill_cost_model is not None:
+            result_dict["dp_cost_model_spec"] = (
+                self.load_inquirer.prefill_cost_model.to_spec()
+            )
         return result_dict
 
     def release_host_resources(self) -> None:
@@ -1991,6 +1996,18 @@ class Scheduler(
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
         self._prev_decode_launch_ts: Optional[float] = None
+        prefill_cost_model = None
+        if self.server_args.load_balance_method == "cost_aware":
+            prefill_cost_model = DeepSeekV4PrefillCostModel.from_hf_config(
+                self.model_config.hf_text_config,
+                attn_tp_size=self.ps.attn_tp_size,
+                attention_tflops_per_gpu=self.server_args.dp_cost_attention_tflops,
+                h2d_bandwidth_gbps=self.server_args.dp_cost_h2d_bandwidth_gbps,
+                storage_bandwidth_gbps=(
+                    self.server_args.dp_cost_storage_bandwidth_gbps
+                ),
+                fp4_indexer=self.server_args.enable_deepseek_v4_fp4_indexer,
+            )
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
@@ -2001,6 +2018,7 @@ class Scheduler(
             tp_worker=self.tp_worker,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             spec_algorithm=self.spec_algorithm,
+            prefill_cost_model=prefill_cost_model,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
@@ -2556,6 +2574,7 @@ class Scheduler(
                     len(req.full_untruncated_fill_ids)
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+                req.storage_prefetch_tokens = len(new_input_tokens)
                 prefix_keys = (
                     tree_cache.get_prefix_hash_values(req.last_host_node)
                     if tree_cache.hicache_storage_pass_prefix_keys
@@ -3160,6 +3179,7 @@ class Scheduler(
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                req.storage_prefetch_tokens = 0
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 

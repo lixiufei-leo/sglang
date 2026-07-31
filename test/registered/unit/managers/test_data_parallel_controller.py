@@ -51,6 +51,8 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl._active_workers = list(range(dp_size))
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
+    ctl.dp_cost_model = MagicMock()
+    ctl.dp_cost_model.estimate.return_value = SimpleNamespace(total_seconds=0.25)
     return ctl
 
 
@@ -117,6 +119,16 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_requests, [10, 2, 30])
         self.assertEqual(budget.total_tokens, [100, 50, 300])
 
+    def test_maps_prefill_cost(self):
+        budget = DPBudget(dp_size=2)
+        budget.update_budget(
+            [
+                _load(dp_rank=0, timestamp=1.0, prefill_cost_s=0.5),
+                _load(dp_rank=1, timestamp=1.0, prefill_cost_s=0.25),
+            ]
+        )
+        self.assertEqual(budget.prefill_cost, [0.5, 0.25])
+
 
 class TestDPBudgetDispatch(CustomTestCase):
     """DPBudget.dispatch picks a rank from current state and updates counters."""
@@ -157,6 +169,18 @@ class TestDPBudgetDispatch(CustomTestCase):
         self.assertEqual(
             rank, 1, "tie on total_tokens should fall back to min total_requests"
         )
+
+    def test_cost_aware_dispatch_applies_estimated_cost(self):
+        budget = DPBudget(dp_size=3)
+        budget.prefill_cost = [0.4, 0.1, 0.2]
+        budget.total_requests = [0, 0, 0]
+        rank = budget.dispatch(
+            LoadBalanceMethod.COST_AWARE,
+            estimated_cost_s=0.05,
+        )
+        self.assertEqual(rank, 1)
+        self.assertAlmostEqual(budget.prefill_cost[1], 0.15)
+        self.assertEqual(budget.total_requests[1], 1)
 
     def test_dispatch_returns_none_for_methods_not_handled(self):
         """Round-robin and follow_bootstrap_room dispatch elsewhere; DPBudget
@@ -260,6 +284,26 @@ class TestTotalRequestsScheduler(CustomTestCase):
             [5, 3, 1, 4],
             "external routing must not mutate DPBudget state",
         )
+
+
+class TestCostAwareScheduler(CustomTestCase):
+    def test_dispatches_to_min_cost_worker_and_adds_request_estimate(self):
+        ctl = _make_controller(dp_size=3)
+        ctl.dp_budget.prefill_cost = [0.4, 0.1, 0.2]
+        ctl.cost_aware_scheduler(_req(input_ids=list(range(128))))
+
+        ctl.workers[1].send_pyobj.assert_called_once()
+        self.assertAlmostEqual(ctl.dp_budget.prefill_cost[1], 0.35)
+        ctl.dp_cost_model.estimate.assert_called_once_with(input_tokens=128)
+
+    def test_routed_dp_rank_bypasses_cost_model_and_budget(self):
+        ctl = _make_controller(dp_size=3)
+        ctl.dp_budget.prefill_cost = [0.4, 0.1, 0.2]
+        ctl.cost_aware_scheduler(_req(routed_dp_rank=0, input_ids=[1, 2]))
+
+        ctl.workers[0].send_pyobj.assert_called_once()
+        ctl.dp_cost_model.estimate.assert_not_called()
+        self.assertEqual(ctl.dp_budget.prefill_cost, [0.4, 0.1, 0.2])
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):

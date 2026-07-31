@@ -969,6 +969,9 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Pessimistic number of tokens submitted to an in-flight L3 prefetch.
+        # Replaced by storage_hit_length when the actual result is available.
+        self.storage_prefetch_tokens = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early

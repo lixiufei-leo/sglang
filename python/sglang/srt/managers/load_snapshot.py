@@ -74,7 +74,7 @@ def should_use_zmq(server_args) -> bool:
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
-_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
+_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens", "cost_aware"})
 
 
 def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
@@ -199,6 +199,14 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     utilization: float = 0.0
+    # Theoretical DeepSeek-V4 prefill service time currently queued on this rank.
+    prefill_cost_s: float = 0.0
+    prefill_csa_indexer_s: float = 0.0
+    prefill_csa_attention_s: float = 0.0
+    prefill_hca_attention_s: float = 0.0
+    prefill_swa_attention_s: float = 0.0
+    prefill_h2d_s: float = 0.0
+    prefill_storage_prefetch_s: float = 0.0
     # cumulative counters
     total_prefill_uncached_tokens: int = 0
     total_prefill_busy_us: int = 0

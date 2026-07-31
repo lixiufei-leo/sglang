@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.dp_cost_model import (
+    DeepSeekV4PrefillCostModel,
+    PrefillCostEstimate,
+)
 from sglang.srt.managers.load_snapshot import (
     DisaggregationMetrics,
     LoadSnapshot,
@@ -41,6 +45,7 @@ class SchedulerLoadInquirer:
     tp_worker: BaseTpWorker
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     spec_algorithm: SpeculativeAlgorithm
+    prefill_cost_model: DeepSeekV4PrefillCostModel | None
     get_running_batch: Callable
     get_waiting_queue: Callable
     get_stats: Callable
@@ -88,8 +93,46 @@ class SchedulerLoadInquirer:
             num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
         return num_tokens
 
+    def get_prefill_cost_estimate(self) -> PrefillCostEstimate:
+        """Estimate queued DSV4 prefill service time from current cache matches."""
+        model = self.prefill_cost_model
+        if model is None or self.disaggregation_mode == DisaggregationMode.DECODE:
+            return PrefillCostEstimate()
+
+        cost = PrefillCostEstimate()
+        for req in self.get_waiting_queue():
+            max_prefix_len = max(0, req.seqlen - 1)
+            pending_storage_tokens = req.storage_prefetch_tokens
+            cached_context_tokens = min(
+                len(req.prefix_indices) + req.host_hit_length + pending_storage_tokens,
+                max_prefix_len,
+            )
+            cost += model.estimate(
+                input_tokens=req.seqlen,
+                cached_context_tokens=cached_context_tokens,
+                host_cache_tokens=req.host_hit_length + pending_storage_tokens,
+                storage_cache_tokens=max(
+                    req.storage_hit_length, pending_storage_tokens
+                ),
+                swa_host_cache_tokens=req.swa_host_hit_length,
+            )
+
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None:
+            # A chunked request has already completed load-back. Its
+            # prefix_indices therefore include both original device hits and
+            # host-loaded tokens; do not charge the transfer a second time.
+            cost += model.estimate(
+                input_tokens=chunked_req.seqlen,
+                cached_context_tokens=min(
+                    len(chunked_req.prefix_indices), chunked_req.seqlen
+                ),
+            )
+        return cost
+
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
+        prefill_cost = self.get_prefill_cost_estimate()
         stats = self.get_stats()
         num_running_reqs = len(self.get_running_batch().reqs)
 
@@ -213,6 +256,13 @@ class SchedulerLoadInquirer:
             gen_throughput=round(stats.gen_throughput, 2),
             cache_hit_rate=round(stats.cache_hit_rate, 4),
             utilization=round(stats.utilization, 4),
+            prefill_cost_s=prefill_cost.total_seconds,
+            prefill_csa_indexer_s=prefill_cost.csa_indexer_seconds,
+            prefill_csa_attention_s=prefill_cost.csa_attention_seconds,
+            prefill_hca_attention_s=prefill_cost.hca_attention_seconds,
+            prefill_swa_attention_s=prefill_cost.swa_attention_seconds,
+            prefill_h2d_s=prefill_cost.h2d_seconds,
+            prefill_storage_prefetch_s=prefill_cost.storage_prefetch_seconds,
             memory=memory,
             speculative=speculative,
             lora=lora,

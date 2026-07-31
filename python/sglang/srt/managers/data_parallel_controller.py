@@ -28,6 +28,9 @@ import zmq
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.dp_cost_model import (
+    DeepSeekV4PrefillCostModel,
+)
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -82,6 +85,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    COST_AWARE = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -97,6 +101,7 @@ class DPBudget:
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        self.prefill_cost = [0.0] * dp_size
         self.last_timestamp = [0.0] * dp_size
 
     def update_budget(self, loads):
@@ -109,8 +114,15 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.prefill_cost[load.dp_rank] = load.prefill_cost_s
 
-    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
+    def dispatch(
+        self,
+        method: LoadBalanceMethod,
+        *,
+        estimated_tokens: int = 0,
+        estimated_cost_s: float = 0.0,
+    ):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
@@ -119,12 +131,18 @@ class DPBudget:
                 range(self.dp_size),
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
+        elif method == LoadBalanceMethod.COST_AWARE:
+            target_rank = min(
+                range(self.dp_size),
+                key=lambda i: (self.prefill_cost[i], self.total_requests[i]),
+            )
         else:
             return None
 
-        # Increment the load of that worker by one as a heuristic
+        # Keep speculative load until a newer scheduler snapshot arrives.
         self.total_requests[target_rank] += 1
         self.total_tokens[target_rank] += estimated_tokens
+        self.prefill_cost[target_rank] += estimated_cost_s
         return target_rank
 
 
@@ -159,11 +177,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.COST_AWARE: self.cost_aware_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.COST_AWARE,
         )
 
         self.launch_dp_size: int = server_args.dp_size
@@ -190,6 +210,7 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.dp_cost_model_spec = None
         self.workers: List[Optional[zmq.Socket]] = [None] * self.max_dp_size
         self.status: List[bool] = list(self.dp_active)
         self._active_workers: List[int] = list(range(self.launch_dp_size))
@@ -207,6 +228,17 @@ class DataParallelController:
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
+
+        self.dp_cost_model = None
+        if self.load_balance_method == LoadBalanceMethod.COST_AWARE:
+            if self.dp_cost_model_spec is None:
+                raise RuntimeError(
+                    "Cost-aware DP dispatch did not receive a cost model from "
+                    "the scheduler"
+                )
+            self.dp_cost_model = DeepSeekV4PrefillCostModel.from_spec(
+                self.dp_cost_model_spec
+            )
 
         self.init_dispatcher()
 
@@ -731,6 +763,16 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        cost_model_spec = scheduler_info[0].get("dp_cost_model_spec")
+        if cost_model_spec is not None:
+            if (
+                self.dp_cost_model_spec is not None
+                and self.dp_cost_model_spec != cost_model_spec
+            ):
+                raise RuntimeError(
+                    "DP schedulers returned inconsistent cost-model specs"
+                )
+            self.dp_cost_model_spec = cost_model_spec
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
@@ -791,6 +833,19 @@ class DataParallelController:
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+        )
+        sock_send(self.workers[target_worker], req)
+
+    def cost_aware_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        assert self.dp_cost_model is not None
+        estimated_cost_s = self.dp_cost_model.estimate(
+            input_tokens=len(req.input_ids)
+        ).total_seconds
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.COST_AWARE,
+            estimated_cost_s=estimated_cost_s,
         )
         sock_send(self.workers[target_worker], req)
 
