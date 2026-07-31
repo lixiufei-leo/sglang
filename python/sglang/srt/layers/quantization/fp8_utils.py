@@ -160,6 +160,7 @@ if _use_aiter:
     from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
     from aiter import (
         gemm_a8w8_blockscale_bpreshuffle,
+        gemm_a8w8_blockscale_bpreshuffle_ck,
         gemm_a8w8_bpreshuffle,
         get_hip_quant,
     )
@@ -1053,23 +1054,44 @@ def aiter_w8a8_block_fp8_linear(
             quant_dtype=aiter.dtypes.fp8,
             transpose_scale=False,
         )
+        if _FORCE_CK_W8A8 and q_input.dtype != weight.dtype:
+            q_input, x_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                q_input, x_scale, None
+            )
+            x_scale.mul_(0.5)
         if materialize_bpreshuffle_scale:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
-    if use_triton:
-        gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
-    elif _use_aiter_bpreshuffle_gfx95:
-        gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
-    else:
-        gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
+    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
 
-    output = gemm_a8w8_blockscale_op(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
-    )
+    if _FORCE_CK_W8A8 and _use_aiter_bpreshuffle_gfx95:
+        output = torch.empty(
+            (input_2d.shape[0], n),
+            dtype=output_dtype,
+            device=input_2d.device,
+        )
+        output = gemm_a8w8_blockscale_bpreshuffle_ck(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            output,
+        )
+    else:
+        if use_triton:
+            gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
+        elif _use_aiter_bpreshuffle_gfx95:
+            gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
+        else:
+            gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
+
+        output = gemm_a8w8_blockscale_op(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=output_dtype,
+        )
 
     if bias is not None:
         output += bias

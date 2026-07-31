@@ -718,6 +718,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
+                layer.weight_scale_inv.data.mul_(0.5)
                 del t
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
