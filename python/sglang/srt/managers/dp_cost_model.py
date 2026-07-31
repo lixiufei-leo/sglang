@@ -348,7 +348,11 @@ class DeepSeekV4PrefillCostModel:
             host_cache_tokens * self.full_cache_bytes_per_input_token
             + swa_host_cache_tokens * self.swa_cache_bytes_per_input_token
         )
-        storage_bytes = storage_cache_tokens * self.full_cache_bytes_per_input_token
+        storage_bytes = (
+            storage_cache_tokens * self.full_cache_bytes_per_input_token
+            + min(storage_cache_tokens, swa_host_cache_tokens)
+            * self.swa_cache_bytes_per_input_token
+        )
 
         return PrefillCostEstimate(
             csa_indexer_seconds=csa_indexer_seconds,

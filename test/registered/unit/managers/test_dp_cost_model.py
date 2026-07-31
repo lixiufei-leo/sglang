@@ -136,6 +136,24 @@ class TestDeepSeekV4PrefillCostModel(CustomTestCase):
             2 * fast.storage_prefetch_seconds,
         )
 
+    def test_storage_prefetch_includes_swa_ring(self):
+        model = _model()
+        estimate = model.estimate(
+            input_tokens=101,
+            cached_context_tokens=100,
+            host_cache_tokens=100,
+            storage_cache_tokens=8,
+            swa_host_cache_tokens=8,
+        )
+        expected_bytes = 8 * (
+            model.full_cache_bytes_per_input_token
+            + model.swa_cache_bytes_per_input_token
+        )
+        self.assertAlmostEqual(
+            estimate.storage_prefetch_seconds,
+            expected_bytes / (25.0 * 1e9),
+        )
+
     def test_swa_loadback_is_capped_to_window(self):
         model = _model()
         window = model.estimate(
