@@ -892,6 +892,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # For DP routing
     routed_dp_rank: Optional[int] = None
+    # Internal DPC ledger metadata. Zero means the request bypassed
+    # load-aware routing.
+    dp_dispatch_seq: int = 0
+    dp_dispatch_cost_s: float = 0.0
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
 
@@ -1207,6 +1211,10 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     positional_embed_overrides: Optional[PositionalEmbeds] = None
     # For DP routing
     routed_dp_rank: Optional[int] = None
+    # Internal DPC ledger metadata. Zero means the request bypassed
+    # load-aware routing.
+    dp_dispatch_seq: int = 0
+    dp_dispatch_cost_s: float = 0.0
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.

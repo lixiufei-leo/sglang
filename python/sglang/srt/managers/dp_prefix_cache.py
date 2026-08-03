@@ -18,6 +18,7 @@ class PrefixCacheHitEstimate(NamedTuple):
     device_tokens: int = 0
     host_tokens: int = 0
     storage_tokens: int = 0
+    promised_tokens: int = 0
 
     @property
     def cached_context_tokens(self) -> int:
@@ -49,6 +50,9 @@ class _LRUPrefixSet:
             return None
         evicted, _ = self.entries.popitem(last=False)
         return evicted
+
+    def discard(self, key: bytes) -> None:
+        self.entries.pop(key, None)
 
     def clear(self) -> None:
         self.entries.clear()
@@ -84,6 +88,9 @@ class DPPrefixCacheTracker:
         self._device = [_LRUPrefixSet(device_pages_per_rank) for _ in range(dp_size)]
         self._host = [_LRUPrefixSet(host_pages_per_rank) for _ in range(dp_size)]
         self._storage = [_LRUPrefixSet(storage_pages_per_rank) for _ in range(dp_size)]
+        self._promised = [
+            _LRUPrefixSet(device_pages_per_rank) for _ in range(dp_size)
+        ]
 
     @staticmethod
     def _as_i64_array(input_ids: Sequence[int]) -> array:
@@ -135,28 +142,38 @@ class DPPrefixCacheTracker:
         host_end = 0
         storage_end = 0
         tier = 0
+        resident_pages = 0
         for page_index, key in enumerate(keys, start=1):
             end = page_index * self.page_size
             if tier == 0 and key in self._device[rank]:
                 device_end = end
                 host_end = end
                 storage_end = end
-                continue
-            if tier <= 1 and key in self._host[rank]:
+            elif tier <= 1 and key in self._host[rank]:
                 tier = 1
                 host_end = end
                 storage_end = end
-                continue
-            if key in self._storage[rank]:
+            elif key in self._storage[rank]:
                 tier = 2
                 storage_end = end
-                continue
-            break
+            else:
+                break
+            resident_pages = page_index
+
+        promised_end = storage_end
+        for page_index, key in enumerate(
+            keys[resident_pages:],
+            start=resident_pages + 1,
+        ):
+            if key not in self._promised[rank]:
+                break
+            promised_end = page_index * self.page_size
 
         return PrefixCacheHitEstimate(
             device_tokens=device_end,
             host_tokens=host_end - device_end,
             storage_tokens=storage_end - host_end,
+            promised_tokens=promised_end - storage_end,
         )
 
     def insert(
@@ -169,11 +186,24 @@ class DPPrefixCacheTracker:
         if rank < 0 or rank >= self.dp_size:
             raise ValueError(f"DP rank {rank} is outside [0, {self.dp_size})")
         for key in self._prefix_keys(input_ids, namespace):
+            self._promised[rank].discard(key)
             if self.host_write_through:
                 self._add_host(rank, key)
             evicted = self._device[rank].add(key)
             if evicted is not None and not self.host_write_through:
                 self._add_host(rank, evicted)
+
+    def promise(
+        self,
+        rank: int,
+        input_ids: Sequence[int],
+        *,
+        namespace: bytes = b"",
+    ) -> None:
+        if rank < 0 or rank >= self.dp_size:
+            raise ValueError(f"DP rank {rank} is outside [0, {self.dp_size})")
+        for key in self._prefix_keys(input_ids, namespace):
+            self._promised[rank].add(key)
 
     def _add_host(self, rank: int, key: bytes) -> None:
         evicted = self._host[rank].add(key)
@@ -181,6 +211,11 @@ class DPPrefixCacheTracker:
             self._storage[rank].add(evicted)
 
     def clear(self) -> None:
-        for tiers in zip(self._device, self._host, self._storage):
+        for tiers in zip(
+            self._device,
+            self._host,
+            self._storage,
+            self._promised,
+        ):
             for tier in tiers:
                 tier.clear()

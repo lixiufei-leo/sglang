@@ -26,6 +26,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    waterfill_cost_aware_batch,
 )
 from sglang.srt.managers.dp_prefix_cache import PrefixCacheHitEstimate
 from sglang.srt.managers.load_snapshot import LoadSnapshot
@@ -59,6 +60,10 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl.dp_prefix_cache.estimate.return_value = [
         PrefixCacheHitEstimate() for _ in range(dp_size)
     ]
+    ctl.dp_cost_target_slack = 0.05
+    ctl.dp_cost_max_request_skew = 2
+    ctl.dp_cost_min_fanout = 0
+    ctl.dp_cost_promised_cache_discount = 0.25
     return ctl
 
 
@@ -135,6 +140,88 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.prefill_cost, [0.5, 0.25])
 
+    def test_new_snapshot_does_not_overwrite_unacked_dispatch(self):
+        budget = DPBudget(dp_size=1)
+        budget.dispatch(
+            LoadBalanceMethod.COST_AWARE,
+            estimated_tokens=128,
+            estimated_cost_s=0.25,
+        )
+
+        budget.update_budget([_load(timestamp=1.0)])
+
+        self.assertEqual(budget.total_requests, [1])
+        self.assertEqual(budget.total_tokens, [128])
+        self.assertEqual(budget.prefill_cost, [0.25])
+        self.assertEqual(len(budget.unacked_dispatches[0]), 1)
+
+    def test_ack_reconciles_to_scheduler_report_without_double_counting(self):
+        budget = DPBudget(dp_size=1)
+        budget.dispatch(
+            LoadBalanceMethod.COST_AWARE,
+            estimated_tokens=128,
+            estimated_cost_s=0.25,
+        )
+
+        budget.update_budget(
+            [
+                _load(
+                    timestamp=1.0,
+                    num_waiting_reqs=1,
+                    num_total_tokens=128,
+                    prefill_cost_s=0.2,
+                    last_accepted_dispatch_seq=1,
+                )
+            ]
+        )
+
+        self.assertEqual(budget.total_requests, [1])
+        self.assertEqual(budget.total_tokens, [128])
+        self.assertEqual(budget.prefill_cost, [0.2])
+        self.assertEqual(len(budget.unacked_dispatches[0]), 0)
+
+    def test_ack_can_reconcile_a_rejected_or_completed_request_to_zero(self):
+        budget = DPBudget(dp_size=1)
+        budget.dispatch(
+            LoadBalanceMethod.COST_AWARE,
+            estimated_tokens=128,
+            estimated_cost_s=0.25,
+        )
+
+        budget.update_budget(
+            [_load(timestamp=1.0, last_accepted_dispatch_seq=1)]
+        )
+
+        self.assertEqual(budget.total_requests, [0])
+        self.assertEqual(budget.total_tokens, [0])
+        self.assertEqual(budget.prefill_cost, [0.0])
+
+    def test_stale_snapshot_cannot_roll_back_ack_reconciliation(self):
+        budget = DPBudget(dp_size=1)
+        budget.dispatch(
+            LoadBalanceMethod.COST_AWARE,
+            estimated_tokens=128,
+            estimated_cost_s=0.25,
+        )
+        budget.update_budget(
+            [
+                _load(
+                    timestamp=2.0,
+                    num_waiting_reqs=1,
+                    prefill_cost_s=0.2,
+                    last_accepted_dispatch_seq=1,
+                )
+            ]
+        )
+
+        budget.update_budget(
+            [_load(timestamp=1.0, last_accepted_dispatch_seq=0)]
+        )
+
+        self.assertEqual(budget.total_requests, [1])
+        self.assertEqual(budget.prefill_cost, [0.2])
+        self.assertEqual(len(budget.unacked_dispatches[0]), 0)
+
 
 class TestDPBudgetDispatch(CustomTestCase):
     """DPBudget.dispatch picks a rank from current state and updates counters."""
@@ -206,6 +293,61 @@ class TestDPBudgetDispatch(CustomTestCase):
         budget = DPBudget(dp_size=3)
         self.assertIsNone(budget.dispatch(LoadBalanceMethod.ROUND_ROBIN))
         self.assertIsNone(budget.dispatch(LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM))
+
+
+class TestWaterfillCostAwareBatch(CustomTestCase):
+    def test_auto_fanout_uses_every_feasible_rank(self):
+        assignments = waterfill_cost_aware_batch(
+            base_loads=[0.0] * 4,
+            request_costs=[[0.01, 1.0, 1.0, 1.0] for _ in range(8)],
+            request_counts=[0] * 4,
+            eligible_ranks=range(4),
+            max_request_skew=2,
+            min_fanout=0,
+            target_slack=0.05,
+        )
+
+        self.assertEqual(set(assignments), {0, 1, 2, 3})
+
+    def test_request_skew_guard_caps_a_strong_cache_preference(self):
+        assignments = waterfill_cost_aware_batch(
+            base_loads=[0.0] * 4,
+            request_costs=[[0.01, 1.0, 1.0, 1.0] for _ in range(16)],
+            request_counts=[0] * 4,
+            eligible_ranks=range(4),
+            max_request_skew=2,
+            min_fanout=1,
+            target_slack=0.05,
+        )
+        counts = [assignments.count(rank) for rank in range(4)]
+
+        self.assertLessEqual(max(counts) - min(counts), 2)
+
+    def test_inactive_ranks_are_never_assigned(self):
+        assignments = waterfill_cost_aware_batch(
+            base_loads=[0.0] * 4,
+            request_costs=[[0.1] * 4 for _ in range(6)],
+            request_counts=[0] * 4,
+            eligible_ranks=[0, 2],
+            max_request_skew=2,
+            min_fanout=0,
+            target_slack=0.05,
+        )
+
+        self.assertLessEqual(set(assignments), {0, 2})
+
+    def test_waterfill_avoids_a_rank_with_high_reported_load(self):
+        assignments = waterfill_cost_aware_batch(
+            base_loads=[10.0, 0.0, 0.0],
+            request_costs=[[0.1, 0.1, 0.1] for _ in range(3)],
+            request_counts=[0, 0, 0],
+            eligible_ranks=range(3),
+            max_request_skew=2,
+            min_fanout=1,
+            target_slack=0.05,
+        )
+
+        self.assertNotIn(0, assignments)
 
 
 class TestRoundRobinScheduler(CustomTestCase):
@@ -305,6 +447,26 @@ class TestTotalRequestsScheduler(CustomTestCase):
 
 
 class TestCostAwareScheduler(CustomTestCase):
+    def test_microbatch_fanout_updates_budget_and_metadata_atomically(self):
+        ctl = _make_controller(dp_size=4)
+        reqs = [
+            _req(input_ids=list(range(index, index + 128)))
+            for index in range(8)
+        ]
+
+        ctl._dispatch_cost_aware_requests(reqs)
+
+        self.assertEqual(ctl.dp_budget.total_requests, [2, 2, 2, 2])
+        self.assertEqual(
+            [worker.send_pyobj.call_count for worker in ctl.workers],
+            [2, 2, 2, 2],
+        )
+        self.assertEqual(
+            sorted(req.dp_dispatch_seq for req in reqs),
+            [1, 1, 1, 1, 2, 2, 2, 2],
+        )
+        self.assertEqual(ctl.dp_prefix_cache.promise.call_count, 8)
+
     def test_dispatches_to_min_projected_cost_and_records_prefix(self):
         ctl = _make_controller(dp_size=3)
         ctl.dp_budget.prefill_cost = [0.4, 0.1, 0.2]
@@ -313,6 +475,8 @@ class TestCostAwareScheduler(CustomTestCase):
 
         ctl.workers[1].send_pyobj.assert_called_once()
         self.assertAlmostEqual(ctl.dp_budget.prefill_cost[1], 0.35)
+        self.assertEqual(req.dp_dispatch_seq, 1)
+        self.assertAlmostEqual(req.dp_dispatch_cost_s, 0.25)
         expected_call = call(
             input_tokens=128,
             cached_context_tokens=0,
@@ -324,9 +488,9 @@ class TestCostAwareScheduler(CustomTestCase):
             ctl.dp_cost_model.estimate.call_args_list,
             [expected_call, expected_call, expected_call],
         )
-        ctl.dp_prefix_cache.insert.assert_called_once()
-        self.assertEqual(ctl.dp_prefix_cache.insert.call_args.args[0], 1)
-        self.assertIs(ctl.dp_prefix_cache.insert.call_args.args[1], req.input_ids)
+        ctl.dp_prefix_cache.promise.assert_called_once()
+        self.assertEqual(ctl.dp_prefix_cache.promise.call_args.args[0], 1)
+        self.assertIs(ctl.dp_prefix_cache.promise.call_args.args[1], req.input_ids)
 
     def test_rank_cache_hit_can_outweigh_a_small_queue_difference(self):
         ctl = _make_controller(dp_size=3)
@@ -345,6 +509,28 @@ class TestCostAwareScheduler(CustomTestCase):
         ctl.workers[1].send_pyobj.assert_called_once()
         self.assertAlmostEqual(ctl.dp_budget.prefill_cost[1], 0.06)
 
+    def test_promised_cache_hit_is_discounted(self):
+        ctl = _make_controller(dp_size=3)
+        ctl.dp_budget.prefill_cost = [0.0, 0.0, 1.0]
+        ctl.dp_prefix_cache.estimate.return_value = [
+            PrefixCacheHitEstimate(),
+            PrefixCacheHitEstimate(promised_tokens=96),
+            PrefixCacheHitEstimate(),
+        ]
+        ctl.dp_cost_model.estimate.side_effect = lambda **kwargs: SimpleNamespace(
+            total_seconds=(0.01 if kwargs["cached_context_tokens"] == 24 else 0.1)
+        )
+
+        ctl.cost_aware_scheduler(_req(input_ids=list(range(128))))
+
+        ctl.workers[1].send_pyobj.assert_called_once()
+        self.assertEqual(
+            ctl.dp_cost_model.estimate.call_args_list[1].kwargs[
+                "cached_context_tokens"
+            ],
+            24,
+        )
+
     def test_routed_dp_rank_bypasses_cost_model_and_budget(self):
         ctl = _make_controller(dp_size=3)
         ctl.dp_budget.prefill_cost = [0.4, 0.1, 0.2]
@@ -354,9 +540,9 @@ class TestCostAwareScheduler(CustomTestCase):
         ctl.workers[0].send_pyobj.assert_called_once()
         ctl.dp_cost_model.estimate.assert_not_called()
         self.assertEqual(ctl.dp_budget.prefill_cost, [0.4, 0.1, 0.2])
-        ctl.dp_prefix_cache.insert.assert_called_once()
-        self.assertEqual(ctl.dp_prefix_cache.insert.call_args.args[0], 0)
-        self.assertIs(ctl.dp_prefix_cache.insert.call_args.args[1], req.input_ids)
+        ctl.dp_prefix_cache.promise.assert_called_once()
+        self.assertEqual(ctl.dp_prefix_cache.promise.call_args.args[0], 0)
+        self.assertIs(ctl.dp_prefix_cache.promise.call_args.args[1], req.input_ids)
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):

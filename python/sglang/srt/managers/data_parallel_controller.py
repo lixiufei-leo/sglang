@@ -15,10 +15,13 @@
 
 import faulthandler
 import logging
+import math
 import multiprocessing as mp
 import signal
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Callable, List, Optional, Sequence
 
@@ -99,25 +102,181 @@ class LoadBalanceMethod(Enum):
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
 
+@dataclass(frozen=True, slots=True)
+class PendingDispatch:
+    seq: int
+    estimated_tokens: int
+    estimated_cost_s: float
+
+
+def waterfill_cost_aware_batch(
+    *,
+    base_loads: Sequence[float],
+    request_costs: Sequence[Sequence[float]],
+    request_counts: Sequence[int],
+    eligible_ranks: Sequence[int],
+    max_request_skew: int,
+    min_fanout: int,
+    target_slack: float,
+) -> list[int]:
+    """Assign a micro-batch while bounding count and projected-finish skew."""
+    dp_size = len(base_loads)
+    if len(request_counts) != dp_size:
+        raise ValueError("request_counts must match base_loads")
+    ranks = sorted(set(eligible_ranks))
+    if not ranks or any(rank < 0 or rank >= dp_size for rank in ranks):
+        raise ValueError("eligible_ranks must contain valid DP ranks")
+    if max_request_skew < 1:
+        raise ValueError("max_request_skew must be at least 1")
+    if min_fanout < 0:
+        raise ValueError("min_fanout cannot be negative")
+    if target_slack < 0:
+        raise ValueError("target_slack cannot be negative")
+    for costs in request_costs:
+        if len(costs) != dp_size:
+            raise ValueError("every request cost row must match base_loads")
+
+    assignments = [-1] * len(request_costs)
+    if not assignments:
+        return assignments
+
+    shadow_loads = list(base_loads)
+    shadow_counts = list(request_counts)
+    min_cost_sum = sum(min(costs[rank] for rank in ranks) for costs in request_costs)
+    target = max(
+        max(shadow_loads[rank] for rank in ranks),
+        (
+            sum(shadow_loads[rank] for rank in ranks) + min_cost_sum
+        )
+        / len(ranks),
+    )
+    target *= 1.0 + target_slack
+
+    fanout_goal = min(
+        len(assignments),
+        len(ranks),
+        min_fanout if min_fanout > 0 else len(ranks),
+    )
+    used_ranks: set[int] = set()
+    request_order = sorted(
+        range(len(request_costs)),
+        key=lambda request_index: (
+            max(request_costs[request_index][rank] for rank in ranks)
+            - min(request_costs[request_index][rank] for rank in ranks),
+            max(request_costs[request_index][rank] for rank in ranks),
+            -request_index,
+        ),
+        reverse=True,
+    )
+
+    for request_index in request_order:
+        costs = request_costs[request_index]
+        min_count = min(shadow_counts[rank] for rank in ranks)
+        candidates = [
+            rank
+            for rank in ranks
+            if shadow_counts[rank] + 1 <= min_count + max_request_skew
+        ]
+        if not candidates:
+            candidates = [
+                rank for rank in ranks if shadow_counts[rank] == min_count
+            ]
+
+        if len(used_ranks) < fanout_goal:
+            unseen = [rank for rank in candidates if rank not in used_ranks]
+            if unseen:
+                candidates = unseen
+
+        fitting = [
+            rank
+            for rank in candidates
+            if shadow_loads[rank] + costs[rank] <= target
+        ]
+        pool = fitting or candidates
+        target_rank = min(
+            pool,
+            key=lambda rank: (
+                shadow_loads[rank] + costs[rank],
+                shadow_counts[rank],
+                rank,
+            ),
+        )
+        assignments[request_index] = target_rank
+        shadow_loads[target_rank] += costs[target_rank]
+        shadow_counts[target_rank] += 1
+        used_ranks.add(target_rank)
+        if not fitting:
+            target = max(target, shadow_loads[target_rank])
+
+    return assignments
+
+
 class DPBudget:
     def __init__(self, dp_size: int):
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
         self.prefill_cost = [0.0] * dp_size
+        self._reported_total_requests = [0] * dp_size
+        self._reported_total_tokens = [0] * dp_size
+        self._reported_prefill_cost = [0.0] * dp_size
+        self.unacked_dispatches: list[deque[PendingDispatch]] = [
+            deque() for _ in range(dp_size)
+        ]
+        self.last_dispatch_seq = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
 
     def update_budget(self, loads):
-        """Update budget from shm snapshots, skipping stale reads."""
+        """Reconcile scheduler snapshots without dropping unacknowledged work."""
         for load in loads:
-            if load.timestamp == self.last_timestamp[load.dp_rank]:
+            rank = load.dp_rank
+            if rank < 0 or rank >= self.dp_size:
                 continue
-            self.last_timestamp[load.dp_rank] = load.timestamp
-            self.total_requests[load.dp_rank] = (
+            if load.timestamp <= self.last_timestamp[rank]:
+                continue
+            self.last_timestamp[rank] = load.timestamp
+            self._reported_total_requests[rank] = (
                 load.num_running_reqs + load.num_waiting_reqs
             )
-            self.total_tokens[load.dp_rank] = load.num_total_tokens
-            self.prefill_cost[load.dp_rank] = load.prefill_cost_s
+            self._reported_total_tokens[rank] = load.num_total_tokens
+            self._reported_prefill_cost[rank] = load.prefill_cost_s
+
+            accepted_seq = max(0, load.last_accepted_dispatch_seq)
+            pending = self.unacked_dispatches[rank]
+            while pending and pending[0].seq <= accepted_seq:
+                pending.popleft()
+
+            self.total_requests[rank] = self._reported_total_requests[rank] + len(
+                pending
+            )
+            self.total_tokens[rank] = self._reported_total_tokens[rank] + sum(
+                item.estimated_tokens for item in pending
+            )
+            self.prefill_cost[rank] = self._reported_prefill_cost[rank] + sum(
+                item.estimated_cost_s for item in pending
+            )
+
+    def record_dispatch(
+        self,
+        rank: int,
+        *,
+        estimated_tokens: int = 0,
+        estimated_cost_s: float = 0.0,
+    ) -> int:
+        if rank < 0 or rank >= self.dp_size:
+            raise ValueError(f"DP rank {rank} is outside [0, {self.dp_size})")
+        self.last_dispatch_seq[rank] += 1
+        self.unacked_dispatches[rank].append(
+            PendingDispatch(
+                seq=self.last_dispatch_seq[rank],
+                estimated_tokens=estimated_tokens,
+                estimated_cost_s=estimated_cost_s,
+            )
+        )
+        self.total_requests[rank] += 1
+        self.total_tokens[rank] += estimated_tokens
+        self.prefill_cost[rank] += estimated_cost_s
+        return self.last_dispatch_seq[rank]
 
     def dispatch(
         self,
@@ -155,10 +314,12 @@ class DPBudget:
         else:
             return None
 
-        # Keep speculative load until a newer scheduler snapshot arrives.
-        self.total_requests[target_rank] += 1
-        self.total_tokens[target_rank] += estimated_tokens
-        self.prefill_cost[target_rank] += selected_cost_s
+        # Keep speculative load until a scheduler snapshot acknowledges it.
+        self.record_dispatch(
+            target_rank,
+            estimated_tokens=estimated_tokens,
+            estimated_cost_s=selected_cost_s,
+        )
         return target_rank
 
 
@@ -178,6 +339,15 @@ class DataParallelController:
             server_args.load_balance_method
         )
         self.run_scheduler_process_func = run_scheduler_process_func
+        self.dp_cost_dispatch_window_s = (
+            server_args.dp_cost_dispatch_window_ms / 1000.0
+        )
+        self.dp_cost_target_slack = server_args.dp_cost_target_slack
+        self.dp_cost_max_request_skew = server_args.dp_cost_max_request_skew
+        self.dp_cost_min_fanout = server_args.dp_cost_min_fanout
+        self.dp_cost_promised_cache_discount = (
+            server_args.dp_cost_promised_cache_discount
+        )
 
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
@@ -335,6 +505,7 @@ class DataParallelController:
             )
             return
         self.status = list(ranks.status)
+        self._refresh_active_workers()
 
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
@@ -377,16 +548,9 @@ class DataParallelController:
         self._active_count_cache = len(self._active_workers)
 
     def refresh_load_budget(self):
-        # Throttle to at most once per 20ms.  When a burst of requests
-        # arrives, dispatching_with_trace() calls this before every
-        # dispatch.  Each call reads the latest scheduler snapshot and
-        # overwrites the speculative +1 increments that DPBudget.dispatch()
-        # added for previously dispatched requests in this burst.  Without
-        # throttling, the budget resets to the (stale) scheduler-reported
-        # value on every request, causing the entire burst to land on a
-        # single DP rank.  The 20ms interval lets the burst complete
-        # using speculative counters, then refreshes from the real
-        # scheduler load for the next batch.
+        # Limit SHM/ZMQ polling overhead. DPBudget reconciles every accepted
+        # snapshot with its unacknowledged dispatch ledger, so refreshes cannot
+        # erase requests that have not reached the scheduler yet.
         now = time.perf_counter()
         if now - self._last_refresh_time < 0.02:
             return
@@ -871,7 +1035,11 @@ class DataParallelController:
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_REQUESTS,
+            estimated_tokens=len(req.input_ids),
+        )
+        self._set_dispatch_metadata(req, target_worker)
         sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
@@ -881,7 +1049,17 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
+        self._set_dispatch_metadata(req, target_worker)
         sock_send(self.workers[target_worker], req)
+
+    def _set_dispatch_metadata(
+        self,
+        req: Req,
+        target_rank: int,
+        estimated_cost_s: float = 0.0,
+    ) -> None:
+        req.dp_dispatch_seq = self.dp_budget.last_dispatch_seq[target_rank]
+        req.dp_dispatch_cost_s = estimated_cost_s
 
     @staticmethod
     def _prefix_cache_namespace(req: Req) -> bytes:
@@ -892,15 +1070,7 @@ class DataParallelController:
             )
         ).encode()
 
-    def cost_aware_scheduler(self, req: Req):
-        if self.maybe_external_dp_rank_routing(req):
-            assert self.dp_prefix_cache is not None
-            self.dp_prefix_cache.insert(
-                req.routed_dp_rank,
-                req.input_ids,
-                namespace=self._prefix_cache_namespace(req),
-            )
-            return
+    def _estimate_cost_aware_request(self, req: Req) -> list[float]:
         assert self.dp_cost_model is not None
         assert self.dp_prefix_cache is not None
         input_tokens = len(req.input_ids)
@@ -909,39 +1079,168 @@ class DataParallelController:
             req.input_ids,
             namespace=namespace,
         )
-        estimated_costs_s = [
-            self.dp_cost_model.estimate(
-                input_tokens=input_tokens,
-                cached_context_tokens=hit.cached_context_tokens,
-                host_cache_tokens=hit.host_transfer_tokens,
-                storage_cache_tokens=hit.storage_tokens,
-                swa_host_cache_tokens=min(
-                    hit.host_transfer_tokens,
-                    self.dp_cost_model.window_size,
-                ),
-            ).total_seconds
-            for hit in rank_hits
-        ]
-        target_worker = self.dp_budget.dispatch(
-            LoadBalanceMethod.COST_AWARE,
-            estimated_costs_s=estimated_costs_s,
+        max_cacheable_tokens = max(0, input_tokens - 1)
+        estimated_costs_s = []
+        for hit in rank_hits:
+            promised_tokens = int(
+                hit.promised_tokens * self.dp_cost_promised_cache_discount
+            )
+            cached_context_tokens = min(
+                max_cacheable_tokens,
+                hit.cached_context_tokens + promised_tokens,
+            )
+            estimated_costs_s.append(
+                self.dp_cost_model.estimate(
+                    input_tokens=input_tokens,
+                    cached_context_tokens=cached_context_tokens,
+                    host_cache_tokens=hit.host_transfer_tokens,
+                    storage_cache_tokens=hit.storage_tokens,
+                    swa_host_cache_tokens=min(
+                        hit.host_transfer_tokens,
+                        self.dp_cost_model.window_size,
+                    ),
+                ).total_seconds
+            )
+        return estimated_costs_s
+
+    def _dispatch_cost_aware_requests(self, reqs: Sequence[Req]) -> None:
+        assert self.dp_prefix_cache is not None
+        routable_reqs = []
+        request_costs = []
+        namespaces = []
+        for req in reqs:
+            namespace = self._prefix_cache_namespace(req)
+            if self.maybe_external_dp_rank_routing(req):
+                self.dp_prefix_cache.promise(
+                    req.routed_dp_rank,
+                    req.input_ids,
+                    namespace=namespace,
+                )
+                continue
+            routable_reqs.append(req)
+            request_costs.append(self._estimate_cost_aware_request(req))
+            namespaces.append(namespace)
+
+        if not routable_reqs:
+            return
+        assignments = waterfill_cost_aware_batch(
+            base_loads=self.dp_budget.prefill_cost,
+            request_costs=request_costs,
+            request_counts=self.dp_budget.total_requests,
+            eligible_ranks=self._active_workers,
+            max_request_skew=self.dp_cost_max_request_skew,
+            min_fanout=self.dp_cost_min_fanout,
+            target_slack=self.dp_cost_target_slack,
         )
-        self.dp_prefix_cache.insert(
-            target_worker,
-            req.input_ids,
-            namespace=namespace,
-        )
-        sock_send(self.workers[target_worker], req)
+        for req, costs, namespace, target_rank in zip(
+            routable_reqs,
+            request_costs,
+            namespaces,
+            assignments,
+        ):
+            estimated_tokens = len(req.input_ids)
+            selected_cost_s = costs[target_rank]
+            self.dp_budget.record_dispatch(
+                target_rank,
+                estimated_tokens=estimated_tokens,
+                estimated_cost_s=selected_cost_s,
+            )
+            self._set_dispatch_metadata(
+                req,
+                target_rank,
+                estimated_cost_s=selected_cost_s,
+            )
+            sock_send(self.workers[target_rank], req)
+            self.dp_prefix_cache.promise(
+                target_rank,
+                req.input_ids,
+                namespace=namespace,
+            )
+
+    def cost_aware_scheduler(self, req: Req):
+        self._dispatch_cost_aware_requests([req])
+
+    def _dispatch_cost_aware_microbatch(self, reqs: Sequence[Req]) -> None:
+        self.refresh_load_budget()
+        time_stats_list = []
+        for req in reqs:
+            time_stats = DPControllerReqTimeStats.new_from_obj(
+                unwrap_from_pickle(req.time_stats)
+            )
+            time_stats.set_dp_dispatch_time()
+            req.time_stats = wrap_as_pickle(time_stats)
+            time_stats_list.append(time_stats)
+
+        self._dispatch_cost_aware_requests(reqs)
+
+        for req, time_stats in zip(reqs, time_stats_list):
+            req.time_stats = time_stats
+            req.time_stats.set_dp_dispatch_finish_time()
+
+    @staticmethod
+    def _cost_aware_request_list(obj) -> Optional[list[Req]]:
+        if isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+            return [obj]
+        if isinstance(
+            obj,
+            (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+        ):
+            return list(obj)
+        return None
 
     def event_loop(self):
-        while True:
+        if self.load_balance_method != LoadBalanceMethod.COST_AWARE:
             while True:
-                self.soft_watchdog.feed()
-                try:
-                    recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
+                while True:
+                    self.soft_watchdog.feed()
+                    try:
+                        recv_req = sock_recv(
+                            self.recv_from_tokenizer,
+                            flags=zmq.NOBLOCK,
+                        )
+                    except zmq.ZMQError:
+                        break
+                    self._request_dispatcher(recv_req)
+
+        pending: list[Req] = []
+        deadline = 0.0
+        while True:
+            self.soft_watchdog.feed()
+            try:
+                recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
+            except zmq.ZMQError:
+                if not pending:
+                    continue
+                remaining_s = deadline - time.perf_counter()
+                if remaining_s > 0:
+                    self.recv_from_tokenizer.poll(
+                        timeout=max(1, math.ceil(remaining_s * 1000))
+                    )
+                    continue
+                self._dispatch_cost_aware_microbatch(pending)
+                pending.clear()
+                continue
+
+            cost_reqs = self._cost_aware_request_list(recv_req)
+            if cost_reqs is None:
+                if pending:
+                    self._dispatch_cost_aware_microbatch(pending)
+                    pending.clear()
                 self._request_dispatcher(recv_req)
+                continue
+
+            if not pending:
+                deadline = time.perf_counter() + self.dp_cost_dispatch_window_s
+            pending.extend(cost_reqs)
+            max_batch_size = max(1, 2 * len(self._active_workers))
+            while len(pending) >= max_batch_size:
+                microbatch = pending[:max_batch_size]
+                del pending[:max_batch_size]
+                self._dispatch_cost_aware_microbatch(microbatch)
+                if pending:
+                    deadline = (
+                        time.perf_counter() + self.dp_cost_dispatch_window_s
+                    )
 
 
 def run_data_parallel_controller_process(

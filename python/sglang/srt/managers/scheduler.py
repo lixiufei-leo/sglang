@@ -1992,6 +1992,7 @@ class Scheduler(
         )
 
     def init_load_inquirer(self) -> None:
+        self.last_accepted_dispatch_seq = 0
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
@@ -2025,6 +2026,10 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             prefill_cost_model=prefill_cost_model,
             get_running_batch=lambda: self.running_batch,
+            get_current_batch=lambda: self.cur_batch_for_debug,
+            get_inflight_prefill_batch=lambda: (
+                self.cur_batch_for_debug if self.enable_overlap else None
+            ),
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
@@ -2037,6 +2042,7 @@ class Scheduler(
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_last_accepted_dispatch_seq=lambda: self.last_accepted_dispatch_seq,
         )
 
     def init_output_streamer(self) -> None:
@@ -2263,10 +2269,16 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _ack_dp_dispatch(self, recv_req) -> None:
+        dispatch_seq = getattr(recv_req, "dp_dispatch_seq", 0)
+        if dispatch_seq > self.last_accepted_dispatch_seq:
+            self.last_accepted_dispatch_seq = dispatch_seq
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        self._ack_dp_dispatch(recv_req)
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -2725,6 +2737,7 @@ class Scheduler(
         self,
         recv_req: TokenizedEmbeddingReqInput,
     ):
+        self._ack_dp_dispatch(recv_req)
         req = Req(
             recv_req.rid,
             recv_req.input_text,

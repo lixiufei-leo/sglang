@@ -195,6 +195,8 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     num_active_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
+    # Highest per-rank DPC dispatch sequence accepted by this scheduler.
+    last_accepted_dispatch_seq: int = 0
     token_usage: float = 0.0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0

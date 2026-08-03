@@ -93,13 +93,38 @@ class TestDPPrefixCacheTracker(CustomTestCase):
             8,
         )
 
+    def test_promised_pages_are_separate_from_resident_hits(self):
+        tracker = _tracker()
+        tracker.promise(0, list(range(13)))
+
+        hit = tracker.estimate(list(range(13)))[0]
+        self.assertEqual(hit.cached_context_tokens, 0)
+        self.assertEqual(hit.promised_tokens, 12)
+
+    def test_materialization_promotes_promised_pages_to_resident(self):
+        tracker = _tracker()
+        tokens = list(range(13))
+        tracker.promise(0, tokens)
+        tracker.insert(0, tokens)
+
+        hit = tracker.estimate(tokens)[0]
+        self.assertEqual(hit.device_tokens, 12)
+        self.assertEqual(hit.promised_tokens, 0)
+
     def test_clear_discards_all_rank_estimates(self):
         tracker = _tracker()
-        tracker.insert(0, list(range(9)))
+        resident = list(range(9))
+        promised = list(range(100, 109))
+        tracker.insert(0, resident)
+        tracker.promise(0, promised)
         tracker.clear()
 
         self.assertEqual(
-            tracker.estimate(list(range(9)))[0].cached_context_tokens,
+            tracker.estimate(resident)[0].cached_context_tokens,
+            0,
+        )
+        self.assertEqual(
+            tracker.estimate(promised)[0].promised_tokens,
             0,
         )
 

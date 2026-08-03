@@ -47,6 +47,8 @@ class SchedulerLoadInquirer:
     spec_algorithm: SpeculativeAlgorithm
     prefill_cost_model: DeepSeekV4PrefillCostModel | None
     get_running_batch: Callable
+    get_current_batch: Callable
+    get_inflight_prefill_batch: Callable
     get_waiting_queue: Callable
     get_stats: Callable
     get_chunked_req: Callable
@@ -59,6 +61,7 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+    get_last_accepted_dispatch_seq: Callable
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -94,13 +97,15 @@ class SchedulerLoadInquirer:
         return num_tokens
 
     def get_prefill_cost_estimate(self) -> PrefillCostEstimate:
-        """Estimate queued DSV4 prefill service time from current cache matches."""
+        """Estimate all waiting and overlap-inflight DSV4 prefill work."""
         model = self.prefill_cost_model
         if model is None or self.disaggregation_mode == DisaggregationMode.DECODE:
             return PrefillCostEstimate()
 
         cost = PrefillCostEstimate()
+        seen: set[int] = set()
         for req in self.get_waiting_queue():
+            seen.add(id(req))
             max_prefix_len = max(0, req.seqlen - 1)
             pending_storage_tokens = req.storage_prefetch_tokens
             cached_context_tokens = min(
@@ -117,24 +122,59 @@ class SchedulerLoadInquirer:
                 swa_host_cache_tokens=req.swa_host_hit_length,
             )
 
+        active_prefill_reqs = []
         chunked_req = self.get_chunked_req()
         if chunked_req is not None:
-            # A chunked request has already completed load-back. Its
-            # prefix_indices therefore include both original device hits and
-            # host-loaded tokens; do not charge the transfer a second time.
+            active_prefill_reqs.append(chunked_req)
+
+        inflight_batch = self.get_inflight_prefill_batch()
+        if (
+            inflight_batch is not None
+            and inflight_batch.forward_mode.is_extend_without_speculative()
+        ):
+            decoding_reqs = getattr(inflight_batch, "decoding_reqs", None) or []
+            decoding_ids = {id(req) for req in decoding_reqs}
+            active_prefill_reqs.extend(
+                req for req in inflight_batch.reqs if id(req) not in decoding_ids
+            )
+
+        for req in active_prefill_reqs:
+            if id(req) in seen:
+                continue
+            seen.add(id(req))
+            # Once selected for a batch, HiCache load-back is complete and
+            # prefix_indices is the materialized context. Charge the current
+            # chunk plus any later chunks, but do not charge transfer twice.
             cost += model.estimate(
-                input_tokens=chunked_req.seqlen,
+                input_tokens=req.seqlen,
                 cached_context_tokens=min(
-                    len(chunked_req.prefix_indices), chunked_req.seqlen
+                    len(req.prefix_indices),
+                    max(0, req.seqlen - 1),
                 ),
             )
         return cost
+
+    def get_num_running_reqs(self) -> int:
+        """Count active requests across running and current batches once."""
+        seen: set[int] = set()
+        for batch in (self.get_running_batch(), self.get_current_batch()):
+            if batch is None:
+                continue
+            for req in batch.reqs:
+                req_id = id(req)
+                if req_id in seen:
+                    continue
+                finished = getattr(req, "finished", None)
+                if callable(finished) and finished():
+                    continue
+                seen.add(req_id)
+        return len(seen)
 
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         prefill_cost = self.get_prefill_cost_estimate()
         stats = self.get_stats()
-        num_running_reqs = len(self.get_running_batch().reqs)
+        num_running_reqs = self.get_num_running_reqs()
 
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
@@ -252,6 +292,7 @@ class SchedulerLoadInquirer:
             num_active_tokens=num_active_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
+            last_accepted_dispatch_seq=self.get_last_accepted_dispatch_seq(),
             token_usage=round(kv_token_usage, 4),
             gen_throughput=round(stats.gen_throughput, 2),
             cache_hit_rate=round(stats.cache_hit_rate, 4),

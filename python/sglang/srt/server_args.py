@@ -1040,6 +1040,37 @@ class ServerArgs:
         "Effective storage-to-host HiCache prefetch bandwidth, in GB/s, used by cost-aware DP dispatch.",
         NS("parallel"),
     ] = 25.0
+    dp_cost_dispatch_window_ms: A[
+        float,
+        (
+            "Cost-aware DPC micro-batch collection window in milliseconds; "
+            "zero dispatches immediately."
+        ),
+        NS("parallel"),
+    ] = 1.0
+    dp_cost_target_slack: A[
+        float,
+        "Fractional slack above the initial cost-aware water-filling target.",
+        NS("parallel"),
+    ] = 0.05
+    dp_cost_max_request_skew: A[
+        int,
+        "Maximum speculative request-count difference allowed across active DP ranks.",
+        NS("parallel"),
+    ] = 2
+    dp_cost_min_fanout: A[
+        int,
+        (
+            "Minimum ranks used by a cost-aware micro-batch; zero uses every "
+            "feasible active rank."
+        ),
+        NS("parallel"),
+    ] = 0
+    dp_cost_promised_cache_discount: A[
+        float,
+        "Fraction of unmaterialized DPC prefix promises credited as cache hits.",
+        NS("parallel"),
+    ] = 0.25
     attn_cp_size: A[
         int,
         Arg(
@@ -3881,6 +3912,24 @@ class ServerArgs:
             ):
                 if value <= 0:
                     raise ValueError(f"--{name.replace('_', '-')} must be positive")
+            for name, value in (
+                ("dp_cost_dispatch_window_ms", self.dp_cost_dispatch_window_ms),
+                ("dp_cost_target_slack", self.dp_cost_target_slack),
+            ):
+                if value < 0:
+                    raise ValueError(
+                        f"--{name.replace('_', '-')} cannot be negative"
+                    )
+            if self.dp_cost_max_request_skew < 1:
+                raise ValueError("--dp-cost-max-request-skew must be at least 1")
+            if not 0 <= self.dp_cost_min_fanout <= self.dp_size:
+                raise ValueError(
+                    "--dp-cost-min-fanout must be between 0 and --dp-size"
+                )
+            if not 0.0 <= self.dp_cost_promised_cache_discount <= 1.0:
+                raise ValueError(
+                    "--dp-cost-promised-cache-discount must be between 0 and 1"
+                )
 
         if self.load_balance_method == "auto":
             # Default behavior:
