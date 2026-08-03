@@ -92,6 +92,7 @@ class LoadBalanceMethod(Enum):
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
     COST_AWARE = auto()
+    PREFILL_DEBT = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -211,12 +212,40 @@ def waterfill_cost_aware_batch(
     return assignments
 
 
+def assign_prefill_debt_batch(
+    *,
+    base_debts: Sequence[float],
+    request_costs: Sequence[float],
+    eligible_ranks: Sequence[int],
+) -> list[int]:
+    """Assign work to the rank with the least projected prefill debt."""
+    ranks = sorted(set(eligible_ranks))
+    if not ranks or any(rank < 0 or rank >= len(base_debts) for rank in ranks):
+        raise ValueError("eligible_ranks must contain valid DP ranks")
+    if any(debt < 0 or not math.isfinite(debt) for debt in base_debts):
+        raise ValueError("base_debts must be finite and non-negative")
+    if any(cost < 0 or not math.isfinite(cost) for cost in request_costs):
+        raise ValueError("request_costs must be finite and non-negative")
+
+    shadow_debts = list(base_debts)
+    assignments = []
+    for cost in request_costs:
+        target_rank = min(
+            ranks,
+            key=lambda rank: (shadow_debts[rank] + cost, rank),
+        )
+        assignments.append(target_rank)
+        shadow_debts[target_rank] += cost
+    return assignments
+
+
 class DPBudget:
     def __init__(self, dp_size: int):
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
         self.prefill_cost = [0.0] * dp_size
+        self.prefill_debt = [0.0] * dp_size
         self._reported_total_requests = [0] * dp_size
         self._reported_total_tokens = [0] * dp_size
         self._reported_prefill_cost = [0.0] * dp_size
@@ -225,6 +254,7 @@ class DPBudget:
         ]
         self.last_dispatch_seq = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
+        self.last_retired_prefill_cost_s = [0.0] * dp_size
 
     def update_budget(self, loads):
         """Reconcile scheduler snapshots without dropping unacknowledged work."""
@@ -246,6 +276,16 @@ class DPBudget:
             while pending and pending[0].seq <= accepted_seq:
                 pending.popleft()
 
+            retired_cost_s = max(0.0, load.retired_dp_prefill_cost_s)
+            if retired_cost_s > self.last_retired_prefill_cost_s[rank]:
+                retired_delta_s = (
+                    retired_cost_s - self.last_retired_prefill_cost_s[rank]
+                )
+                self.prefill_debt[rank] = max(
+                    0.0, self.prefill_debt[rank] - retired_delta_s
+                )
+                self.last_retired_prefill_cost_s[rank] = retired_cost_s
+
             self.total_requests[rank] = self._reported_total_requests[rank] + len(
                 pending
             )
@@ -262,6 +302,7 @@ class DPBudget:
         *,
         estimated_tokens: int = 0,
         estimated_cost_s: float = 0.0,
+        track_prefill_debt: bool = False,
     ) -> int:
         if rank < 0 or rank >= self.dp_size:
             raise ValueError(f"DP rank {rank} is outside [0, {self.dp_size})")
@@ -276,6 +317,8 @@ class DPBudget:
         self.total_requests[rank] += 1
         self.total_tokens[rank] += estimated_tokens
         self.prefill_cost[rank] += estimated_cost_s
+        if track_prefill_debt:
+            self.prefill_debt[rank] += estimated_cost_s
         return self.last_dispatch_seq[rank]
 
     def dispatch(
@@ -285,6 +328,7 @@ class DPBudget:
         estimated_tokens: int = 0,
         estimated_cost_s: float = 0.0,
         estimated_costs_s: Sequence[float] | None = None,
+        eligible_ranks: Sequence[int] | None = None,
     ):
         selected_cost_s = estimated_cost_s
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -311,6 +355,14 @@ class DPBudget:
                 ),
             )
             selected_cost_s = estimated_costs_s[target_rank]
+        elif method == LoadBalanceMethod.PREFILL_DEBT:
+            target_rank = assign_prefill_debt_batch(
+                base_debts=self.prefill_debt,
+                request_costs=[estimated_cost_s],
+                eligible_ranks=(
+                    range(self.dp_size) if eligible_ranks is None else eligible_ranks
+                ),
+            )[0]
         else:
             return None
 
@@ -319,6 +371,7 @@ class DPBudget:
             target_rank,
             estimated_tokens=estimated_tokens,
             estimated_cost_s=selected_cost_s,
+            track_prefill_debt=(method == LoadBalanceMethod.PREFILL_DEBT),
         )
         return target_rank
 
@@ -364,12 +417,14 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
             LoadBalanceMethod.COST_AWARE: self.cost_aware_scheduler,
+            LoadBalanceMethod.PREFILL_DEBT: self.prefill_debt_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
             LoadBalanceMethod.COST_AWARE,
+            LoadBalanceMethod.PREFILL_DEBT,
         )
 
         self.launch_dp_size: int = server_args.dp_size
@@ -417,7 +472,10 @@ class DataParallelController:
             self.control_message_step = 1
 
         self.dp_cost_model = None
-        if self.load_balance_method == LoadBalanceMethod.COST_AWARE:
+        if self.load_balance_method in (
+            LoadBalanceMethod.COST_AWARE,
+            LoadBalanceMethod.PREFILL_DEBT,
+        ):
             if self.dp_cost_model_spec is None:
                 raise RuntimeError(
                     "Cost-aware DP dispatch did not receive a cost model from "
@@ -426,6 +484,8 @@ class DataParallelController:
             self.dp_cost_model = DeepSeekV4PrefillCostModel.from_spec(
                 self.dp_cost_model_spec
             )
+
+        if self.load_balance_method == LoadBalanceMethod.COST_AWARE:
             page_size = server_args.page_size
             device_pages = max(1, self.max_total_num_tokens // page_size)
             host_pages = 0
@@ -1159,6 +1219,41 @@ class DataParallelController:
 
     def cost_aware_scheduler(self, req: Req):
         self._dispatch_cost_aware_requests([req])
+
+    def prefill_debt_scheduler(self, req: Req):
+        assert self.dp_cost_model is not None
+        estimated_cost_s = self.dp_cost_model.estimate(
+            input_tokens=len(req.input_ids)
+        ).total_seconds
+        estimated_tokens = len(req.input_ids)
+
+        if req.routed_dp_rank is not None:
+            target_rank = req.routed_dp_rank
+            if (
+                target_rank not in self._active_workers
+                or self.workers[target_rank] is None
+            ):
+                raise ValueError(f"DP rank {target_rank} is not active.")
+            self.dp_budget.record_dispatch(
+                target_rank,
+                estimated_tokens=estimated_tokens,
+                estimated_cost_s=estimated_cost_s,
+                track_prefill_debt=True,
+            )
+        else:
+            target_rank = self.dp_budget.dispatch(
+                LoadBalanceMethod.PREFILL_DEBT,
+                estimated_tokens=estimated_tokens,
+                estimated_cost_s=estimated_cost_s,
+                eligible_ranks=self._active_workers,
+            )
+
+        self._set_dispatch_metadata(
+            req,
+            target_rank,
+            estimated_cost_s=estimated_cost_s,
+        )
+        sock_send(self.workers[target_rank], req)
 
     def _dispatch_cost_aware_microbatch(self, reqs: Sequence[Req]) -> None:
         self.refresh_load_budget()

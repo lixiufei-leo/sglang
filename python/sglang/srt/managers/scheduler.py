@@ -1993,12 +1993,13 @@ class Scheduler(
 
     def init_load_inquirer(self) -> None:
         self.last_accepted_dispatch_seq = 0
+        self.retired_dp_prefill_cost_s = 0.0
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
         self._prev_decode_launch_ts: Optional[float] = None
         prefill_cost_model = None
-        if self.server_args.load_balance_method == "cost_aware":
+        if self.server_args.load_balance_method in ("cost_aware", "prefill_debt"):
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
                 is_unified_kv_triton,
             )
@@ -2043,6 +2044,7 @@ class Scheduler(
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_last_accepted_dispatch_seq=lambda: self.last_accepted_dispatch_seq,
+            get_retired_dp_prefill_cost_s=lambda: self.retired_dp_prefill_cost_s,
         )
 
     def init_output_streamer(self) -> None:
@@ -2274,6 +2276,18 @@ class Scheduler(
         if dispatch_seq > self.last_accepted_dispatch_seq:
             self.last_accepted_dispatch_seq = dispatch_seq
 
+    def _retire_dp_prefill_debt(self, req: Req) -> None:
+        if req.dp_prefill_debt_retired:
+            return
+        req.dp_prefill_debt_retired = True
+        self.retired_dp_prefill_cost_s += req.dp_dispatch_cost_s
+
+    def _retire_completed_dp_prefill_debt(self, batch: ScheduleBatch) -> None:
+        decoding_reqs = set(batch.decoding_reqs or ())
+        for req in batch.reqs:
+            if req not in decoding_reqs and req.inflight_middle_chunks <= 0:
+                self._retire_dp_prefill_debt(req)
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2327,6 +2341,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
+                dp_dispatch_cost_s=recv_req.dp_dispatch_cost_s,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
@@ -2366,6 +2381,7 @@ class Scheduler(
                         )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
+                    self._retire_dp_prefill_debt(req)
                     return
 
         elif (
@@ -2406,6 +2422,7 @@ class Scheduler(
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
+                dp_dispatch_cost_s=recv_req.dp_dispatch_cost_s,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
@@ -2651,6 +2668,7 @@ class Scheduler(
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            self._retire_dp_prefill_debt(req)
             return False
         return True
 
@@ -2701,6 +2719,7 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        self._retire_dp_prefill_debt(req_to_abort)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2726,6 +2745,7 @@ class Scheduler(
                     ),
                     req,
                 )
+                self._retire_dp_prefill_debt(req)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -2744,6 +2764,7 @@ class Scheduler(
             recv_req.input_ids,
             recv_req.sampling_params,
             positional_embed_overrides=recv_req.positional_embed_overrides,
+            dp_dispatch_cost_s=recv_req.dp_dispatch_cost_s,
             token_type_ids=recv_req.token_type_ids,
             routed_dp_rank=recv_req.routed_dp_rank,
             priority=recv_req.priority,
@@ -2852,6 +2873,7 @@ class Scheduler(
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._retire_dp_prefill_debt(req)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -3792,6 +3814,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if batch.forward_mode.is_extend():
+            self._retire_completed_dp_prefill_debt(batch)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
@@ -4308,6 +4332,7 @@ class Scheduler(
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self._retire_dp_prefill_debt(req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -4342,6 +4367,7 @@ class Scheduler(
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(rid=req.rid), req
                 )
+                self._retire_dp_prefill_debt(req)
                 if (
                     req.req_pool_idx is not None
                     or getattr(req, "mamba_pool_idx", None) is not None

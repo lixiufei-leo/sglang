@@ -26,6 +26,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    assign_prefill_debt_batch,
     waterfill_cost_aware_batch,
 )
 from sglang.srt.managers.dp_prefix_cache import PrefixCacheHitEstimate
@@ -348,6 +349,141 @@ class TestWaterfillCostAwareBatch(CustomTestCase):
         )
 
         self.assertNotIn(0, assignments)
+
+
+class TestPrefillDebtAssignment(CustomTestCase):
+    def test_equal_work_spreads_exactly(self):
+        assignments = assign_prefill_debt_batch(
+            base_debts=[0.0] * 4,
+            request_costs=[1.0] * 16,
+            eligible_ranks=range(4),
+        )
+
+        self.assertEqual(
+            [assignments.count(rank) for rank in range(4)],
+            [4, 4, 4, 4],
+        )
+
+    def test_work_imbalance_is_bounded_by_largest_request(self):
+        request_costs = [8.0, 1.0, 7.0, 2.0, 6.0, 3.0, 5.0, 4.0]
+        assignments = assign_prefill_debt_batch(
+            base_debts=[0.0] * 4,
+            request_costs=request_costs,
+            eligible_ranks=range(4),
+        )
+        loads = [0.0] * 4
+        for cost, rank in zip(request_costs, assignments):
+            loads[rank] += cost
+
+        self.assertLessEqual(max(loads) - min(loads), max(request_costs))
+
+    def test_inactive_ranks_are_never_assigned(self):
+        assignments = assign_prefill_debt_batch(
+            base_debts=[0.0] * 4,
+            request_costs=[1.0] * 8,
+            eligible_ranks=[1, 3],
+        )
+
+        self.assertLessEqual(set(assignments), {1, 3})
+
+
+class TestPrefillDebtBudgetLifecycle(CustomTestCase):
+    def test_acceptance_does_not_retire_debt(self):
+        budget = DPBudget(dp_size=1)
+        budget.dispatch(
+            LoadBalanceMethod.PREFILL_DEBT,
+            estimated_tokens=128,
+            estimated_cost_s=0.25,
+        )
+
+        budget.update_budget(
+            [
+                _load(
+                    timestamp=1.0,
+                    num_waiting_reqs=1,
+                    last_accepted_dispatch_seq=1,
+                )
+            ]
+        )
+
+        self.assertAlmostEqual(budget.prefill_debt[0], 0.25)
+        self.assertEqual(len(budget.unacked_dispatches[0]), 0)
+
+    def test_only_monotonic_retirement_reduces_debt(self):
+        budget = DPBudget(dp_size=1)
+        budget.dispatch(
+            LoadBalanceMethod.PREFILL_DEBT,
+            estimated_cost_s=0.25,
+        )
+
+        budget.update_budget(
+            [_load(timestamp=1.0, retired_dp_prefill_cost_s=0.1)]
+        )
+        self.assertAlmostEqual(budget.prefill_debt[0], 0.15)
+
+        budget.update_budget(
+            [_load(timestamp=2.0, retired_dp_prefill_cost_s=0.1)]
+        )
+        self.assertAlmostEqual(budget.prefill_debt[0], 0.15)
+
+        budget.update_budget(
+            [_load(timestamp=3.0, retired_dp_prefill_cost_s=0.25)]
+        )
+        self.assertAlmostEqual(budget.prefill_debt[0], 0.0)
+
+    def test_cumulative_float_accounting_closes_without_drift(self):
+        budget = DPBudget(dp_size=1)
+        costs = [(index % 7 + 1) * 1e-6 for index in range(1000)]
+        for cost in costs:
+            budget.record_dispatch(
+                0,
+                estimated_cost_s=cost,
+                track_prefill_debt=True,
+            )
+
+        total_cost = sum(costs)
+        budget.update_budget(
+            [
+                _load(
+                    timestamp=1.0,
+                    last_accepted_dispatch_seq=len(costs),
+                    retired_dp_prefill_cost_s=total_cost,
+                )
+            ]
+        )
+
+        self.assertAlmostEqual(budget.prefill_debt[0], 0.0, places=12)
+
+
+class TestPrefillDebtScheduler(CustomTestCase):
+    def test_burst_spreads_without_waiting_for_snapshots(self):
+        ctl = _make_controller(dp_size=4)
+        reqs = [_req(input_ids=list(range(128))) for _ in range(8)]
+
+        for req in reqs:
+            ctl.prefill_debt_scheduler(req)
+
+        self.assertEqual(
+            [worker.send_pyobj.call_count for worker in ctl.workers],
+            [2, 2, 2, 2],
+        )
+        self.assertEqual(ctl.dp_budget.prefill_debt, [0.5, 0.5, 0.5, 0.5])
+        self.assertEqual(
+            sorted(req.dp_dispatch_seq for req in reqs),
+            [1, 1, 1, 1, 2, 2, 2, 2],
+        )
+        ctl.dp_prefix_cache.estimate.assert_not_called()
+
+    def test_explicit_rank_is_included_in_debt(self):
+        ctl = _make_controller(dp_size=4)
+        req = _req(routed_dp_rank=2, input_ids=list(range(128)))
+
+        ctl.prefill_debt_scheduler(req)
+
+        ctl.workers[2].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.dp_budget.prefill_debt, [0.0, 0.0, 0.25, 0.0])
+        self.assertEqual(req.dp_dispatch_seq, 1)
+        self.assertAlmostEqual(req.dp_dispatch_cost_s, 0.25)
 
 
 class TestRoundRobinScheduler(CustomTestCase):

@@ -73,6 +73,7 @@ def _inquirer(
         get_total_prefill_busy_us=lambda: 0,
         get_decode_moment_totals=lambda: [0.0] * 6,
         get_last_accepted_dispatch_seq=lambda: 0,
+        get_retired_dp_prefill_cost_s=lambda: 0.0,
     )
 
 

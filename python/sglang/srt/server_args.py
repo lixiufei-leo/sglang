@@ -1021,6 +1021,7 @@ class ServerArgs:
                 "total_requests",
                 "total_tokens",
                 "cost_aware",
+                "prefill_debt",
             ],
         ),
         NS("parallel"),
@@ -3901,7 +3902,7 @@ class ServerArgs:
                 f"Invalid disaggregation_mode={self.disaggregation_mode!r}"
             )
 
-        if self.load_balance_method == "cost_aware":
+        if self.load_balance_method in ("cost_aware", "prefill_debt"):
             for name, value in (
                 ("dp_cost_attention_tflops", self.dp_cost_attention_tflops),
                 ("dp_cost_h2d_bandwidth_gbps", self.dp_cost_h2d_bandwidth_gbps),

@@ -802,6 +802,7 @@ class Req(ReqDllmMixin):
         bootstrap_room: Optional[int] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
+        dp_dispatch_cost_s: float = 0.0,
         disagg_prefill_dp_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
@@ -1124,6 +1125,8 @@ class Req(ReqDllmMixin):
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
+        self.dp_dispatch_cost_s: float = dp_dispatch_cost_s
+        self.dp_prefill_debt_retired: bool = False
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
 
         # the start index of the sent kv cache

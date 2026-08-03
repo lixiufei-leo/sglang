@@ -212,6 +212,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # cumulative counters
     total_prefill_uncached_tokens: int = 0
     total_prefill_busy_us: int = 0
+    retired_dp_prefill_cost_s: float = 0.0
     # Decode step-time moment sums
     decode_moments: Optional[list[float]] = None
 
