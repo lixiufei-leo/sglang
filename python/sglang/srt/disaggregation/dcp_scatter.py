@@ -1,5 +1,21 @@
 """Prefill-side scatter of DeepSeek-V4 unified_kv rows to their owning decode rank.
 
+Sibling of ``common/utils.build_dcp_token_transfer_plan`` (sglang #32997 and its
+predecessor), which does the same job for the GENERIC layout. The algebra is
+identical -- ``owner = x % N``, ``local = x // N`` -- and only the index space
+differs:
+
+    generic : x = global TOKEN POSITION. Needs the chunk phase
+              (src_page_offset / decode_prefix_len) to place the round robin,
+              and requires decode_prefix_len to align to page_size * dcp_size.
+    v4      : x = unified_kv STORAGE SLOT, which the decode allocator hands out,
+              so there is no phase to track; and slots below swa_pages are the
+              replicated SWA ring, which the generic plan has no notion of.
+
+Keep the two side by side rather than forcing one to serve both: collapsing
+them would mean teaching the generic builder about a replicated prefix region
+that only DeepSeek-V4 has, on a path mooncake/nixl also depend on.
+
 numpy-only and free of any transport dependency, so the mapping can be exercised
 on its own (dcp/gpu/l5_pd_scatter.py drives this exact function across two
 nodes). mori/conn.py is the only production caller.
