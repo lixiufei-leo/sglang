@@ -191,12 +191,16 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
-    # DeepSeek-V4 unified_kv physical DCP: the decode pool stores only its
-    # 1/dcp shard of the COMPRESSED rows, so the prefill side must scatter.
-    # dcp_size == 1 (the default, and what any older decode peer reports)
-    # means "not sharded" and every code path below is a no-op.
-    dcp_size: int = 1
-    dcp_rank: int = 0
+    # Decode-side DCP geometry. NAMES AND PAYLOAD SLOTS MATCH sglang #32997
+    # ("mori: support DCP KV relayout"), which carries dst_dcp_size/dst_dcp_rank
+    # at payload[13]/[14] for the generic token-position round-robin. We reuse
+    # both verbatim and only APPEND dcp_swa_pages at [15], which is the one
+    # piece #32997 has no notion of: DeepSeek-V4's unified_kv keeps a
+    # replicated SWA ring in front of the sharded compressed rows.
+    # dst_dcp_size == 1 (the default, and what any older peer reports) means
+    # "not sharded" and every path below is a no-op.
+    dst_dcp_size: int = 1
+    dst_dcp_rank: int = 0
     dcp_swa_pages: int = 0
 
     @property
@@ -225,10 +229,17 @@ class KVArgsRegisterInfo:
             if len(payload) > 12 and payload[12]
             else []
         )
-        # Optional trailer; absent when the decode peer predates physical DCP.
-        dcp_size = int(payload[13].decode("ascii")) if len(payload) > 13 else 1
-        dcp_rank = int(payload[14].decode("ascii")) if len(payload) > 14 else 0
-        dcp_swa_pages = int(payload[15].decode("ascii")) if len(payload) > 15 else 0
+        # Optional trailer; absent when the decode peer predates DCP.
+        # [13]/[14] are #32997's slots and carry the same meaning there.
+        dst_dcp_size = (
+            int(payload[13].decode("ascii")) if len(payload) > 13 and payload[13] else 1
+        )
+        dst_dcp_rank = (
+            int(payload[14].decode("ascii")) if len(payload) > 14 and payload[14] else 0
+        )
+        dcp_swa_pages = (
+            int(payload[15].decode("ascii")) if len(payload) > 15 and payload[15] else 0
+        )
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -239,8 +250,8 @@ class KVArgsRegisterInfo:
             gpu_id=gpu_id,
             decode_tp_size=decode_tp_size,
             decode_tp_rank=decode_tp_rank,
-            dcp_size=dcp_size,
-            dcp_rank=dcp_rank,
+            dst_dcp_size=dst_dcp_size,
+            dst_dcp_rank=dst_dcp_rank,
             dcp_swa_pages=dcp_swa_pages,
             dst_kv_item_len=dst_kv_item_len,
             dst_state_item_lens=dst_state_item_lens,
@@ -893,8 +904,8 @@ class MoriKVManager(CommonKVManager):
         from sglang.srt.disaggregation.dcp_scatter import dcp_scatter
 
         return dcp_scatter(
-            peer_info.dcp_size,
-            peer_info.dcp_rank,
+            peer_info.dst_dcp_size,
+            peer_info.dst_dcp_rank,
             peer_info.dcp_swa_pages,
             prefill_kv_indices,
             dst_kv_indices,
