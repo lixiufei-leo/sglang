@@ -92,6 +92,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dcp.capacity import aggregate_dcp_kv_capacity
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -1954,24 +1955,13 @@ class Scheduler(
         )
 
     def _reported_max_total_num_tokens(self) -> int:
-        """Pool capacity to report, accounting for decode context parallel.
-
-        Under DCP the KV is sharded across the group, so the aggregate capacity
-        is dcp_size x the per-rank pool -- EXCEPT for DeepSeek-V4, whose
-        allocator runs the SWA branch over an unsharded page_size and whose
-        unified_kv pool only shards when SGLANG_DSV4_DCP_PHYSICAL is set. With
-        read-only DCP (the default) the pool is still fully replicated, so
-        scaling here would over-report capacity by dcp_size and poison every
-        utilisation / hit-rate metric derived from it.
-        """
-        dcp = self.server_args.dcp_size
-        if dcp <= 1:
-            return self.max_total_num_tokens
-        if self.server_args.attention_backend == "dsv4":
-            pool = getattr(self, "token_to_kv_pool", None)
-            if not getattr(pool, "unified_physical_dcp", False):
-                return self.max_total_num_tokens
-        return self.max_total_num_tokens * dcp
+        """Allocator-visible KV capacity, including virtual DCP expansion."""
+        server_args = getattr(self, "server_args", None)
+        return aggregate_dcp_kv_capacity(
+            self.max_total_num_tokens,
+            dcp_size=getattr(server_args, "dcp_size", 1),
+            attention_backend=getattr(server_args, "attention_backend", None),
+        )
 
     def init_invariant_checker(self) -> None:
         self.invariant_checker = SchedulerInvariantChecker(
@@ -2100,7 +2090,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * self.server_args.dcp_size
+                self._reported_max_total_num_tokens()
                 - paged_input_len
                 - self.page_size
                 - 1,
