@@ -205,5 +205,3 @@ def topk_transform_512_dcp_sharded(
             final_valid, final_raw, torch.full_like(final_raw, -1)
         )
         out_raw_indices.copy_(final_raw.to(out_raw_indices.dtype))
-
-

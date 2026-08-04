@@ -70,4 +70,3 @@ def dcp_scatter(
         prefill_kv_indices[owned],
         local[owned].astype(dst_kv_indices.dtype),
     )
-
