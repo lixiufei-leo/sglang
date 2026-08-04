@@ -685,11 +685,13 @@ class MoriKVManager(CommonKVManager):
             str(self._compute_prefill_unique_rank()).encode("ascii"),
             failure_reason.encode("utf-8") if failure_reason else b"",
         ]
+        notified_peers = 0
         for info in infos:
             try:
                 na = NetworkAddress(info.endpoint, info.dst_port)
                 socket = self._connect_threadsafe(na.to_tcp(), is_ipv6=na.is_ipv6)
                 socket.send_multipart(payload)
+                notified_peers += 1
             except Exception:
                 logger.exception(
                     "Failed to sync status %s to decode endpoint %s:%s for room %s",
@@ -698,6 +700,15 @@ class MoriKVManager(CommonKVManager):
                     info.dst_port,
                     bootstrap_room,
                 )
+        if status == KVPoll.Success:
+            logger.info(
+                "MoriKV transfer completed: room=%s prefill_rank=%s "
+                "notified_peers=%s/%s",
+                bootstrap_room,
+                self._compute_prefill_unique_rank(),
+                notified_peers,
+                len(infos),
+            )
 
     def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
         engine_key = register_info.engine_key
@@ -706,11 +717,20 @@ class MoriKVManager(CommonKVManager):
             return
         self.engine.register_remote_engine(register_info.engine_desc)
         self.decode_kv_args_table[engine_key] = register_info
-        logger.debug(
-            "Registered decode peer %s (%s:%s)",
+        logger.info(
+            "MoriKV DCP peer registered: key=%s endpoint=%s:%s "
+            "kv_descs=%s aux_descs=%s state_components=%s "
+            "dcp_size=%s dcp_rank=%s dcp_swa_pages=%s kv_item_len=%s",
             engine_key,
             register_info.endpoint,
             register_info.dst_port,
+            len(register_info.dst_kv_mem_descs),
+            len(register_info.dst_aux_mem_descs),
+            len(register_info.dst_state_mem_descs),
+            register_info.dst_dcp_size,
+            register_info.dst_dcp_rank,
+            register_info.dcp_swa_pages,
+            register_info.dst_kv_item_len,
         )
 
     def _get_mha_mem_desc_slices(
