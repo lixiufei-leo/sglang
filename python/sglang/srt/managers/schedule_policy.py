@@ -459,6 +459,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        prefill_linear_tokens_per_second: Optional[float] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -549,6 +550,10 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        self.prefill_linear_tokens_per_second = prefill_linear_tokens_per_second
+        self.rem_prefill_cost_s: Optional[float] = None
+        self._prefill_cost_budget_initialized = False
+        self.prefill_cost_max_chunk_tokens = rem_chunk_tokens
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -865,6 +870,47 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def _sync_prefill_cost_budget(self) -> None:
+        if self._prefill_cost_budget_initialized:
+            return
+        self._prefill_cost_budget_initialized = True
+        if (
+            self.prefill_linear_tokens_per_second is None
+            or self.prefill_delayer_single_pass is None
+        ):
+            return
+        self.rem_prefill_cost_s = getattr(
+            self.prefill_delayer_single_pass, "target_prefill_cost_s", None
+        )
+
+    def _estimate_prefill_chunk_cost_s(self, chunk_tokens: int) -> float:
+        if self.prefill_linear_tokens_per_second is None or chunk_tokens <= 0:
+            return 0.0
+        return chunk_tokens / self.prefill_linear_tokens_per_second
+
+    def _largest_chunk_within_prefill_cost(
+        self,
+        max_chunk_tokens: int,
+    ) -> int:
+        budget_s = self.rem_prefill_cost_s
+        if budget_s is None or self.prefill_linear_tokens_per_second is None:
+            return max_chunk_tokens
+        if max_chunk_tokens <= 0:
+            return 0
+
+        if self._estimate_prefill_chunk_cost_s(max_chunk_tokens) <= budget_s + 1e-12:
+            return max_chunk_tokens
+        budget_tokens = int(
+            (budget_s + 1e-12) * self.prefill_linear_tokens_per_second
+        )
+        return min(max_chunk_tokens, budget_tokens // self.page_size * self.page_size)
+
+    def _consume_prefill_cost(self, chunk_tokens: int) -> None:
+        if self.rem_prefill_cost_s is None:
+            return
+        cost_s = self._estimate_prefill_chunk_cost_s(chunk_tokens)
+        self.rem_prefill_cost_s = max(0.0, self.rem_prefill_cost_s - cost_s)
+
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
@@ -893,6 +939,7 @@ class PrefillAdder:
                 max_running_requests=self.max_running_requests,
                 waiting_queue_len=self.waiting_queue_len,
             )
+            self._sync_prefill_cost_budget()
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -901,6 +948,7 @@ class PrefillAdder:
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
+        self._consume_prefill_cost(new_len)
         self._update_prefill_budget(
             0,
             req.extend_range.length,
@@ -1090,6 +1138,14 @@ class PrefillAdder:
         real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
+        if self.prefill_linear_tokens_per_second is not None:
+            pending_storage_tokens = req.storage_prefetch_tokens
+            pre_load_input_tokens = len(req.full_untruncated_fill_ids) - min(
+                prefix_len + req.host_hit_length + pending_storage_tokens,
+                len(req.full_untruncated_fill_ids) - 1,
+            )
+        else:
+            pre_load_input_tokens = real_input_tokens
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
@@ -1122,6 +1178,7 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
+        shape_with_prefill_cost = False
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
@@ -1145,16 +1202,40 @@ class PrefillAdder:
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
             # report not-prefillable via finalize()) and before init_load_back
             # (a delay verdict must not start KV load-back).
-            if (self.prefill_delayer_single_pass is not None) and (
-                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+            if self.prefill_delayer_single_pass is not None:
+                allow_prefill = self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                     local_prefillable=True,
                     running_batch=self.running_batch.batch_size(),
                     max_prefill_bs=self.max_prefill_bs,
                     max_running_requests=self.max_running_requests,
                     waiting_queue_len=self.waiting_queue_len,
                 )
-            ):
-                return AddReqResult.OTHER
+                self._sync_prefill_cost_budget()
+                if not allow_prefill:
+                    return AddReqResult.OTHER
+
+            # Do not create extra prefill rounds for a request that already
+            # exceeds the scheduler's natural chunk size. Balancing can still
+            # choose how many single-chunk requests enter this step, while
+            # committed continuations always advance by their natural chunk.
+            shape_with_prefill_cost = self.rem_prefill_cost_s is not None and (
+                self.prefill_cost_max_chunk_tokens is None
+                or pre_load_input_tokens <= self.prefill_cost_max_chunk_tokens
+            )
+            if shape_with_prefill_cost:
+                max_cost_chunk = pre_load_input_tokens
+                if chunk_tokens_limit is not None:
+                    max_cost_chunk = min(max_cost_chunk, chunk_tokens_limit)
+                cost_chunk = self._largest_chunk_within_prefill_cost(
+                    max_cost_chunk,
+                )
+                if cost_chunk <= 0:
+                    if self.can_run_list:
+                        return AddReqResult.OTHER
+                    cost_chunk = min(max_cost_chunk, self.page_size)
+                if cost_chunk == pre_load_input_tokens:
+                    cost_chunk = self.ceil_paged_tokens(cost_chunk)
+                chunk_tokens_limit = cost_chunk
 
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
@@ -1251,6 +1332,13 @@ class PrefillAdder:
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
+
+        if (
+            self.rem_prefill_cost_s is not None
+            and self.can_run_list
+            and self.can_run_list[-1] is req
+        ):
+            self._consume_prefill_cost(req.extend_range.length)
 
         return self.budget_state()
 

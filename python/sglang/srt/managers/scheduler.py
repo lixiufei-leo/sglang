@@ -3155,6 +3155,19 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        if get_schedule().enable_pd_prefill_step_balance:
+            assert chunked_prefill_size is not None
+            assert prefill_delayer_single_pass is not None
+            natural_cost_s = self.load_inquirer.get_next_prefill_step_cost_s(
+                max_input_tokens=self.max_prefill_tokens,
+                max_chunk_tokens=chunked_prefill_size,
+                page_size=self.page_size,
+                linear_tokens_per_second=(
+                    get_schedule().pd_prefill_step_balance_linear_tokens_per_second
+                ),
+            )
+            prefill_delayer_single_pass.set_local_prefill_cost_s(natural_cost_s)
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -3171,6 +3184,11 @@ class Scheduler(
             prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            prefill_linear_tokens_per_second=(
+                get_schedule().pd_prefill_step_balance_linear_tokens_per_second
+                if get_schedule().enable_pd_prefill_step_balance
+                else None
+            ),
             waiting_queue_len=len(self.waiting_queue),
         )
 

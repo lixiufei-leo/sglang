@@ -88,6 +88,74 @@ class SchedulerLoadInquirer:
             num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
         return num_tokens
 
+    def get_next_prefill_step_cost_s(
+        self,
+        *,
+        max_input_tokens: int,
+        max_chunk_tokens: int,
+        page_size: int,
+        linear_tokens_per_second: float,
+    ) -> float:
+        """Estimate the linear service time naturally admitted next step."""
+        if linear_tokens_per_second <= 0:
+            raise ValueError("linear_tokens_per_second must be positive")
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return 0.0
+
+        rem_input_tokens = max(0, max_input_tokens)
+        rem_chunk_tokens = max(0, max_chunk_tokens)
+        cost_s = 0.0
+        seen: set[int] = set()
+
+        def add_req(req, *, materialized_prefix: bool) -> bool:
+            nonlocal cost_s, rem_input_tokens, rem_chunk_tokens
+            seen.add(id(req))
+            max_prefix_len = max(0, req.seqlen - 1)
+            if materialized_prefix:
+                cached_context_tokens = min(
+                    len(req.prefix_indices), max_prefix_len
+                )
+            else:
+                cached_context_tokens = min(
+                    len(req.prefix_indices)
+                    + req.host_hit_length
+                    + req.storage_prefetch_tokens,
+                    max_prefix_len,
+                )
+
+            remaining_tokens = req.seqlen - cached_context_tokens
+            take_tokens = min(
+                remaining_tokens, rem_input_tokens, rem_chunk_tokens
+            )
+            if take_tokens < remaining_tokens:
+                take_tokens = take_tokens // page_size * page_size
+            if take_tokens <= 0:
+                return False
+
+            cost_s += take_tokens / linear_tokens_per_second
+            rem_input_tokens -= take_tokens
+            rem_chunk_tokens -= take_tokens
+            return (
+                take_tokens == remaining_tokens
+                and rem_input_tokens > 0
+                and rem_chunk_tokens > 0
+            )
+
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None and not add_req(
+            chunked_req, materialized_prefix=True
+        ):
+            return cost_s
+
+        for req in self.get_waiting_queue():
+            if id(req) in seen:
+                continue
+            if not add_req(req, materialized_prefix=False):
+                break
+        return cost_s
+
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         stats = self.get_stats()

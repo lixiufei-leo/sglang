@@ -12,7 +12,10 @@ import requests
 import torch
 
 from sglang.benchmark.serving import run_benchmark
-from sglang.srt.managers.prefill_delayer import PrefillDelayer
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
+    select_pd_prefill_target_cost,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -36,6 +39,33 @@ register_cuda_ci(
 WORLD_SIZE = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
 
 # ============================ Unit Tests ============================
+
+
+class TestPdPrefillStepTarget(unittest.TestCase):
+    def test_selects_positive_percentile_with_slack(self):
+        target = select_pd_prefill_target_cost(
+            [0.0, 8.0, 1.0, float("nan"), 4.0, 2.0],
+            percentile=0.75,
+            slack=0.1,
+        )
+        self.assertAlmostEqual(target, 4.4)
+
+    def test_empty_positive_costs_disable_cap(self):
+        self.assertIsNone(
+            select_pd_prefill_target_cost([0.0, -1.0], 0.75, 0.1)
+        )
+
+    def test_balanced_positive_costs_disable_cap(self):
+        self.assertIsNone(
+            select_pd_prefill_target_cost([1.0, 1.04, 1.09], 0.75, 0.1)
+        )
+
+
+class TestPdPrefillSingletonTarget(unittest.TestCase):
+    def test_single_positive_cost_disables_cap(self):
+        self.assertIsNone(
+            select_pd_prefill_target_cost([0.0, 4.0, float("nan")], 0.75, 0.1)
+        )
 
 
 @dataclass

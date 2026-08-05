@@ -3224,6 +3224,35 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = None
+    enable_pd_prefill_step_balance: A[
+        bool,
+        "Balance DP-attention prefill step cost across PD prefill ranks.",
+        NS("schedule"),
+    ] = False
+    pd_prefill_step_balance_target_percentile: A[
+        float,
+        (
+            "Percentile of positive per-rank natural prefill costs used as the "
+            "shared step-cost cap."
+        ),
+        NS("schedule"),
+    ] = 0.75
+    pd_prefill_step_balance_slack: A[
+        float,
+        (
+            "Relative slack added to the shared PD prefill step-cost cap after "
+            "the percentile is selected."
+        ),
+        NS("schedule"),
+    ] = 0.1
+    pd_prefill_step_balance_linear_tokens_per_second: A[
+        float,
+        (
+            "Effective per-rank dense/MoE prefill throughput used to add the "
+            "linear new-token component to PD prefill step cost."
+        ),
+        NS("schedule"),
+    ] = 6000.0
 
     # -------------------------------------------------------------------------
     # Min free slots delay (prefill refill batching)
@@ -8760,6 +8789,43 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        if self.enable_pd_prefill_step_balance:
+            if self.disaggregation_mode != "prefill":
+                raise ValueError(
+                    "--enable-pd-prefill-step-balance requires "
+                    "--disaggregation-mode=prefill"
+                )
+            if not self.enable_dp_attention:
+                raise ValueError(
+                    "--enable-pd-prefill-step-balance requires "
+                    "--enable-dp-attention"
+                )
+            if not self.enable_prefill_delayer:
+                raise ValueError(
+                    "--enable-pd-prefill-step-balance requires "
+                    "--enable-prefill-delayer"
+                )
+            if (
+                self.chunked_prefill_size is None
+                or self.chunked_prefill_size <= 0
+            ):
+                raise ValueError(
+                    "--enable-pd-prefill-step-balance requires chunked prefill"
+                )
+            if not 0 < self.pd_prefill_step_balance_target_percentile <= 1:
+                raise ValueError(
+                    "--pd-prefill-step-balance-target-percentile must be in (0, 1]"
+                )
+            if self.pd_prefill_step_balance_slack < 0:
+                raise ValueError(
+                    "--pd-prefill-step-balance-slack must be non-negative"
+                )
+            if self.pd_prefill_step_balance_linear_tokens_per_second <= 0:
+                raise ValueError(
+                    "--pd-prefill-step-balance-linear-tokens-per-second must "
+                    "be positive"
+                )
 
         # Check pdmux
         if self.enable_pdmux:
