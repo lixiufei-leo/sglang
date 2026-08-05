@@ -989,13 +989,12 @@ class KVCacheConfigurator:
             online_mtp_max_draft_tokens=(
                 self.server_args.max_speculative_num_draft_tokens or 0
             ),
-            # NOTE(rebase of #29185): the PR patched
-            # model_executor/model_runner_kv_cache_mixin.py::_init_pools, which
-            # upstream moved into this configurator. get_parallel() is the
-            # canonical source in current main (ModelRunner.dcp_size/dcp_rank
-            # mirror it: model_runner.py:266-267).
-            dcp_size=get_parallel().dcp_size,
-            dcp_rank=get_parallel().dcp_rank,
+            # NOTE(rebase of #29185): the original call site passed
+            # ModelRunner.dcp_size/dcp_rank, which are valid for both DCP=1 and
+            # DCP>1. The attention accessors preserve that contract when the
+            # DCP group is intentionally absent at world size one.
+            dcp_size=get_parallel().attn_dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
         )
         return token_to_kv_pool
 
