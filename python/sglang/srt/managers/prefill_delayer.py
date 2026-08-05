@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -15,6 +16,8 @@ if TYPE_CHECKING:
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
 logger = logging.getLogger(__name__)
+
+_COST_FIXED_POINT_SCALE = 1_000_000_000
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,31 @@ class _NegotiateOutput(NamedTuple):
     # cannot convey it to the metrics observation.
     wait_forward_passes: int = 0
     wait_seconds: float = 0.0
+    target_prefill_cost_s: Optional[float] = None
+
+
+def select_pd_prefill_target_cost(
+    costs_s: list[float], percentile: float, slack: float
+) -> Optional[float]:
+    """Select a robust cap without letting idle ranks force a zero-sized step."""
+    if not 0 < percentile <= 1:
+        raise ValueError("percentile must be in (0, 1]")
+    if slack < 0:
+        raise ValueError("slack must be non-negative")
+
+    positive_costs = sorted(x for x in costs_s if x > 0 and math.isfinite(x))
+    # A singleton fanout has no cross-rank skew to reduce. Leaving it uncapped
+    # also preserves the original chunk shape for shared-prefix warmup requests.
+    if len(positive_costs) < 2:
+        return None
+
+    # If natural work is already within the admitted slack, shaping cannot
+    # improve the step barrier and only adds scheduler-side cost accounting.
+    if positive_costs[-1] <= positive_costs[0] * (1.0 + slack):
+        return None
+
+    index = math.ceil(percentile * len(positive_costs)) - 1
+    return positive_costs[index] * (1.0 + slack)
 
 
 class PrefillDelayer:
@@ -58,6 +86,15 @@ class PrefillDelayer:
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
         self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
+        self._pd_prefill_step_balance_enabled = getattr(
+            server_args, "enable_pd_prefill_step_balance", False
+        )
+        self._pd_prefill_step_balance_target_percentile = getattr(
+            server_args, "pd_prefill_step_balance_target_percentile", 0.75
+        )
+        self._pd_prefill_step_balance_slack = getattr(
+            server_args, "pd_prefill_step_balance_slack", 0.1
+        )
         # Fall back to 5000ms if unset; this is a local safety cap, not a
         # semantic default, so we don't surface it via ServerArgs.
         self._max_delay_ms = server_args.prefill_delayer_max_delay_ms
@@ -71,6 +108,7 @@ class PrefillDelayer:
             f"queue_min_ratio={self._queue_min_ratio} "
             f"max_delay_ms={self._max_delay_ms} "
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
+            f" step_balance_enabled={self._pd_prefill_step_balance_enabled}"
         )
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
@@ -95,9 +133,9 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len, natural_prefill_cost.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, attn_tp_size, 6),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -119,6 +157,7 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        local_prefill_cost_s: float = 0.0,
     ) -> _NegotiateOutput:
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
@@ -128,6 +167,7 @@ class PrefillDelayer:
             max_prefill_bs=max_prefill_bs,
             max_running_requests=max_running_requests,
             waiting_queue_len=waiting_queue_len,
+            local_prefill_cost_s=local_prefill_cost_s,
         )
         self._curr_state = out.next_state
         return out
@@ -142,6 +182,7 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        local_prefill_cost_s: float = 0.0,
     ) -> _NegotiateOutput:
         # Compute local states
         local_token_watermark_force_allow = (
@@ -157,12 +198,14 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
+            local_prefill_cost_s=local_prefill_cost_s,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
+        global_prefill_cost = tp0_info[:, 5]
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -174,10 +217,25 @@ class PrefillDelayer:
         global_exists_token_watermark_force_allow = (
             global_token_watermark_force_allow.max().item() > 0
         )
+        target_prefill_cost_s = None
+        if self._pd_prefill_step_balance_enabled:
+            costs_s = [
+                value / _COST_FIXED_POINT_SCALE
+                for value, prefillable in zip(
+                    global_prefill_cost.tolist(), global_prefillable.tolist()
+                )
+                if prefillable
+            ]
+            target_prefill_cost_s = select_pd_prefill_target_cost(
+                costs_s,
+                self._pd_prefill_step_balance_target_percentile,
+                self._pd_prefill_step_balance_slack,
+            )
         debug_info = dict(
             input_estimation=prefillable_status,
             num_prefillable=global_prefillable.sum().item(),
             num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
+            target_prefill_cost_s=target_prefill_cost_s,
         )
 
         # Wait accumulated so far, taken from prev_state. Release paths attach
@@ -307,7 +365,14 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
+        local_prefill_cost_s: float = 0.0,
     ):
+        if not math.isfinite(local_prefill_cost_s) or local_prefill_cost_s < 0:
+            local_prefill_cost_s = 0.0
+        fixed_point_cost = min(
+            round(local_prefill_cost_s * _COST_FIXED_POINT_SCALE),
+            torch.iinfo(torch.int64).max,
+        )
         local_info = torch.tensor(
             [
                 int(local_prefillable),
@@ -315,6 +380,7 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                fixed_point_cost,
             ],
             device=self._gather_device,
             dtype=torch.int64,
@@ -333,10 +399,24 @@ class PrefillDelayerSinglePassExecutor:
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
         self._result: Optional[_NegotiateOutput] = None
+        self._local_prefill_cost_s = 0.0
 
     @property
     def _called(self) -> bool:
         return self._result is not None
+
+    def set_local_prefill_cost_s(self, cost_s: float) -> None:
+        if self._called:
+            raise RuntimeError("prefill cost must be set before negotiation")
+        if cost_s < 0 or not math.isfinite(cost_s):
+            raise ValueError("prefill cost must be finite and non-negative")
+        self._local_prefill_cost_s = cost_s
+
+    @property
+    def target_prefill_cost_s(self) -> Optional[float]:
+        if self._result is None:
+            return None
+        return self._result.target_prefill_cost_s
 
     def finalize(self, *, actual_prefill: bool):
         if not self._called:
@@ -364,6 +444,7 @@ class PrefillDelayerSinglePassExecutor:
                 max_prefill_bs=max_prefill_bs,
                 max_running_requests=max_running_requests,
                 waiting_queue_len=waiting_queue_len,
+                local_prefill_cost_s=self._local_prefill_cost_s,
             )
         return self._result.output_allow
 

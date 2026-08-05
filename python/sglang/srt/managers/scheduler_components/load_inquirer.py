@@ -154,6 +154,95 @@ class SchedulerLoadInquirer:
             )
         return cost
 
+    def get_next_prefill_step_cost_s(
+        self,
+        *,
+        max_input_tokens: int,
+        max_chunk_tokens: int,
+        page_size: int,
+        linear_tokens_per_second: float,
+    ) -> float:
+        """Estimate the work this rank would naturally admit on its next step."""
+        if linear_tokens_per_second <= 0:
+            raise ValueError("linear_tokens_per_second must be positive")
+        model = self.prefill_cost_model
+        if model is None or self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return 0.0
+
+        rem_input_tokens = max(0, max_input_tokens)
+        rem_chunk_tokens = max(0, max_chunk_tokens)
+        cost_s = 0.0
+        seen: set[int] = set()
+
+        def add_req(req, *, materialized_prefix: bool) -> bool:
+            nonlocal cost_s, rem_input_tokens, rem_chunk_tokens
+            seen.add(id(req))
+            max_prefix_len = max(0, req.seqlen - 1)
+            if materialized_prefix:
+                cached_context_tokens = min(
+                    len(req.prefix_indices), max_prefix_len
+                )
+                host_cache_tokens = 0
+                storage_cache_tokens = 0
+                swa_host_cache_tokens = 0
+            else:
+                pending_storage_tokens = req.storage_prefetch_tokens
+                cached_context_tokens = min(
+                    len(req.prefix_indices)
+                    + req.host_hit_length
+                    + pending_storage_tokens,
+                    max_prefix_len,
+                )
+                host_cache_tokens = req.host_hit_length + pending_storage_tokens
+                storage_cache_tokens = max(
+                    req.storage_hit_length, pending_storage_tokens
+                )
+                swa_host_cache_tokens = req.swa_host_hit_length
+
+            remaining_tokens = req.seqlen - cached_context_tokens
+            take_tokens = min(
+                remaining_tokens, rem_input_tokens, rem_chunk_tokens
+            )
+            if take_tokens < remaining_tokens:
+                take_tokens = take_tokens // page_size * page_size
+            if take_tokens <= 0:
+                return False
+
+            # The shared DSV4 model intentionally omits request-linear
+            # dense/MoE work, which is material when cache hits change the
+            # number of new tokens admitted by each rank.
+            attention_and_transfer_cost = model.estimate(
+                input_tokens=cached_context_tokens + take_tokens,
+                cached_context_tokens=cached_context_tokens,
+                host_cache_tokens=host_cache_tokens,
+                storage_cache_tokens=storage_cache_tokens,
+                swa_host_cache_tokens=swa_host_cache_tokens,
+            )
+            cost_s += (
+                attention_and_transfer_cost.total_seconds
+                + take_tokens / linear_tokens_per_second
+            )
+            rem_input_tokens -= take_tokens
+            rem_chunk_tokens -= take_tokens
+            return (
+                take_tokens == remaining_tokens
+                and rem_input_tokens > 0
+                and rem_chunk_tokens > 0
+            )
+
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None and not add_req(
+            chunked_req, materialized_prefix=True
+        ):
+            return cost_s
+
+        for req in self.get_waiting_queue():
+            if id(req) in seen:
+                continue
+            if not add_req(req, materialized_prefix=False):
+                break
+        return cost_s
+
     def get_num_running_reqs(self) -> int:
         """Count active requests across running and current batches once."""
         seen: set[int] = set()

@@ -39,6 +39,7 @@ def _req(*, seqlen=128, prefix_tokens=0, finished=False):
 def _inquirer(
     *,
     model=None,
+    disaggregation_mode=DisaggregationMode.NULL,
     running_batch=None,
     current_batch=None,
     inflight_batch=None,
@@ -47,7 +48,7 @@ def _inquirer(
 ):
     empty_batch = _batch([])
     return SchedulerLoadInquirer(
-        disaggregation_mode=DisaggregationMode.NULL,
+        disaggregation_mode=disaggregation_mode,
         ps=None,
         server_args=None,
         max_total_num_tokens=0,
@@ -114,6 +115,44 @@ class TestSchedulerLoadInquirerPrefillCost(CustomTestCase):
             input_tokens=128,
             cached_context_tokens=16,
         )
+
+    def test_next_step_cost_includes_linear_new_token_time(self):
+        model = MagicMock()
+        model.estimate.return_value = PrefillCostEstimate(
+            csa_indexer_seconds=0.25
+        )
+        req = _req(seqlen=100, prefix_tokens=20)
+        inquirer = _inquirer(
+            model=model,
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            waiting_queue=[req],
+        )
+
+        cost_s = inquirer.get_next_prefill_step_cost_s(
+            max_input_tokens=70,
+            max_chunk_tokens=70,
+            page_size=10,
+            linear_tokens_per_second=100.0,
+        )
+
+        self.assertAlmostEqual(cost_s, 0.95)
+        model.estimate.assert_called_once_with(
+            input_tokens=90,
+            cached_context_tokens=20,
+            host_cache_tokens=0,
+            storage_cache_tokens=0,
+            swa_host_cache_tokens=0,
+        )
+
+    def test_next_step_cost_rejects_nonpositive_linear_throughput(self):
+        inquirer = _inquirer()
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            inquirer.get_next_prefill_step_cost_s(
+                max_input_tokens=10,
+                max_chunk_tokens=10,
+                page_size=1,
+                linear_tokens_per_second=0.0,
+            )
 
 
 class TestSchedulerLoadInquirerRunningCount(CustomTestCase):

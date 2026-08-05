@@ -27,13 +27,27 @@ class _RecordingDelayer:
     the local_prefillable value of every negotiate call and returns a fixed
     verdict."""
 
-    def __init__(self, allow: bool):
+    def __init__(self, allow: bool, target_prefill_cost_s=None):
         self.allow = allow
         self.calls = []
+        self.target_prefill_cost_s = target_prefill_cost_s
 
     def negotiate_should_allow_prefill(self, local_prefillable, **kwargs):
         self.calls.append(local_prefillable)
         return self.allow
+
+
+class _LinearPrefillCostModel:
+    def estimate(
+        self,
+        *,
+        input_tokens,
+        cached_context_tokens=0,
+        **kwargs,
+    ):
+        return SimpleNamespace(
+            total_seconds=(input_tokens - cached_context_tokens) / 100.0
+        )
 
 
 class TestPrefillAdder(CustomTestCase):
@@ -719,15 +733,102 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(delayer.calls, [True])
         self.assertIn(req, adder.can_run_list)
 
+    def test_prefill_cost_budget_trims_first_request_by_page(self):
+        delayer = _RecordingDelayer(allow=True, target_prefill_cost_s=0.35)
+        adder = self._create_delayer_adder(
+            available_tokens=100_000,
+            delayer=delayer,
+            page_size=10,
+            rem_chunk_tokens=100,
+            prefill_cost_model=_LinearPrefillCostModel(),
+        )
+        req = self._create_delayer_req(100)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(req.extend_range, Range(0, 30))
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertAlmostEqual(adder.rem_prefill_cost_s, 0.05)
+
+    def test_prefill_cost_budget_does_not_fragment_multi_chunk_request(self):
+        delayer = _RecordingDelayer(allow=True, target_prefill_cost_s=0.35)
+        adder = self._create_delayer_adder(
+            available_tokens=100_000,
+            delayer=delayer,
+            page_size=10,
+            rem_chunk_tokens=100,
+            prefill_cost_model=_LinearPrefillCostModel(),
+        )
+        req = self._create_delayer_req(200)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(req.extend_range, Range(0, 100))
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertAlmostEqual(adder.rem_prefill_cost_s, 0.0)
+
+    def test_prefill_cost_budget_stops_before_second_load_back(self):
+        delayer = _RecordingDelayer(allow=True, target_prefill_cost_s=0.25)
+        adder = self._create_delayer_adder(
+            available_tokens=100_000,
+            delayer=delayer,
+            page_size=10,
+            rem_chunk_tokens=100,
+            prefill_cost_model=_LinearPrefillCostModel(),
+        )
+        first = self._create_delayer_req(20)
+        second = self._create_delayer_req(100)
+
+        first_result = adder.add_one_req(
+            first, has_chunked_req=False, truncation_align_size=None
+        )
+        second_result = adder.add_one_req(
+            second, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(first_result, AddReqResult.CONTINUE)
+        self.assertEqual(second_result, AddReqResult.OTHER)
+        self.assertEqual(second.set_extend_range.call_count, 0)
+        self.assertNotIn(second, adder.can_run_list)
+
+    def test_prefill_cost_adds_linear_service_time(self):
+        delayer = _RecordingDelayer(allow=True, target_prefill_cost_s=1.0)
+        adder = self._create_delayer_adder(
+            available_tokens=100_000,
+            delayer=delayer,
+            prefill_cost_model=_LinearPrefillCostModel(),
+            prefill_linear_tokens_per_second=100.0,
+        )
+        req = self._create_delayer_req(100)
+
+        cost_s = adder._estimate_prefill_chunk_cost_s(
+            req,
+            20,
+            cached_context_tokens=0,
+            include_host_transfer=False,
+        )
+
+        self.assertAlmostEqual(cost_s, 0.4)
+
     def test_chunked_req_negotiates_prefillable_and_proceeds(self):
         """A rank resuming a chunked prefill runs it this pass regardless of
         the verdict, so add_chunked_req must report prefillable=True (else a
         rank with an empty waiting queue reports False via finalize() and
         peers delay while it prefills alone) and must not drop the chunk on
         a delay verdict (that would leak memory)."""
-        delayer = _RecordingDelayer(allow=False)
+        delayer = _RecordingDelayer(allow=False, target_prefill_cost_s=0.35)
         adder = self._create_delayer_adder(
-            available_tokens=100_000, delayer=delayer, rem_chunk_tokens=500
+            available_tokens=100_000,
+            delayer=delayer,
+            page_size=10,
+            rem_chunk_tokens=500,
+            prefill_cost_model=_LinearPrefillCostModel(),
         )
         req = self._create_delayer_req(200)
 
@@ -735,6 +836,8 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertIsNone(result)  # chunk fully admitted, not truncated
         self.assertEqual(delayer.calls, [True])
+        self.assertEqual(req.extend_range, Range(0, 200))
+        self.assertAlmostEqual(adder.rem_prefill_cost_s, 0.0)
         self.assertIn(req, adder.can_run_list)
 
     def _create_delayer_adder(self, *, available_tokens, delayer, **kwargs):
@@ -750,6 +853,9 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_mock_req("delayer_req", priority=0, max_new_tokens=8)
         req.full_untruncated_fill_ids = list(range(num_tokens))
         req.host_hit_length = 0
+        req.storage_prefetch_tokens = 0
+        req.storage_hit_length = 0
+        req.swa_host_hit_length = 0
         req.last_node = MagicMock()
         req.sampling_params.ignore_eos = False
         req.set_extend_range = MagicMock(
