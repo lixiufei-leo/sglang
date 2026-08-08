@@ -35,10 +35,14 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         )
 
     if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:
-        if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+        if server_args.disaggregation_transfer_backend not in (
+            "mooncake",
+            "nixl",
+            "mori",
+        ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake or nixl, got "
+                "mooncake or nixl or mori, got "
                 f"{server_args.disaggregation_transfer_backend!r}."
             )
         if server_args.disaggregation_decode_enable_radix_cache:
@@ -108,11 +112,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     if server_args.disaggregation_mode in ("prefill", "decode"):
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-            and server_args.disaggregation_transfer_backend not in ("mooncake", "nixl")
+            and server_args.disaggregation_transfer_backend
+            not in ("mooncake", "nixl", "mori")
         ):
             raise ValueError(
                 f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                f"disaggregation_transfer_backend='mooncake' or 'nixl', "
+                f"disaggregation_transfer_backend='mooncake' or 'nixl' or 'mori', "
                 f"got '{server_args.disaggregation_transfer_backend}'."
             )
 

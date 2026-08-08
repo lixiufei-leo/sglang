@@ -37,6 +37,7 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
+    build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -307,6 +308,44 @@ class BatchTransferPlan:
         return not self.sizes
 
 
+def _validate_batch_write_bounds(
+    *,
+    src_descs: List[MemoryDesc],
+    local_offsets: List[List[int]],
+    dst_descs: List[MemoryDesc],
+    remote_offsets: List[List[int]],
+    sizes: List[List[int]],
+    label: str,
+) -> None:
+    """Fail with transfer context before mori sees an out-of-bounds entry."""
+
+    for i, (src_desc, dst_desc) in enumerate(zip(src_descs, dst_descs)):
+        offs_local = np.asarray(local_offsets[i], dtype=np.int64)
+        offs_remote = np.asarray(remote_offsets[i], dtype=np.int64)
+        lens = np.asarray(sizes[i], dtype=np.int64)
+        if lens.size == 0:
+            continue
+        src_cap, dst_cap = int(src_desc.size), int(dst_desc.size)
+        bad = (
+            (lens < 0)
+            | (offs_local < 0)
+            | (offs_remote < 0)
+            | (offs_local + lens > src_cap)
+            | (offs_remote + lens > dst_cap)
+        )
+        if not bad.any():
+            continue
+
+        j = int(np.flatnonzero(bad)[0])
+        raise ValueError(
+            f"[mori-bounds] {label}: descriptor pair {i}, entry {j} of "
+            f"{lens.size} escapes its registered region. "
+            f"local={int(offs_local[j])}+{int(lens[j])} vs src={src_cap}; "
+            f"remote={int(offs_remote[j])}+{int(lens[j])} vs dst={dst_cap}; "
+            f"n_bad={int(bad.sum())}"
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class TransferTarget:
     info: TransferInfo
@@ -322,6 +361,7 @@ class _TransferChunk:
     aux_index: Optional[int]
     normalized_state: Optional[List[Optional[npt.NDArray[np.int32]]]]
     wait_event: Optional[object] = None
+    num_kv_tokens: Optional[int] = None
 
 
 class MoriKVManager(CommonKVManager):
@@ -763,6 +803,16 @@ class MoriKVManager(CommonKVManager):
         self, dst_mem_descs: List[MemoryDesc]
     ) -> tuple[List[MemoryDesc], List[MemoryDesc], int]:
         src_descs = self.kv_mem_descs
+        if len(src_descs) == len(dst_mem_descs):
+            return src_descs, dst_mem_descs, len(src_descs)
+
+        mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
+        if mla_ratios:
+            src_slice, dst_slice = self._mla_slice_ptrs_for_pp(
+                src_descs, dst_mem_descs, mla_ratios
+            )
+            return src_slice, dst_slice, len(src_slice)
+
         num_local_layers = len(src_descs)
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
@@ -778,9 +828,20 @@ class MoriKVManager(CommonKVManager):
         src_desc: MemoryDesc,
         dst_desc: MemoryDesc,
         plan: BatchTransferPlan,
+        label: str = "kv",
     ) -> List[TransferStatus]:
         if plan.empty():
             return []
+
+        if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
+            _validate_batch_write_bounds(
+                src_descs=[src_desc],
+                local_offsets=[plan.local_offsets],
+                dst_descs=[dst_desc],
+                remote_offsets=[plan.remote_offsets],
+                sizes=[plan.sizes],
+                label=label,
+            )
 
         transfer_uid = self.engine.allocate_transfer_uid()
 
@@ -912,36 +973,12 @@ class MoriKVManager(CommonKVManager):
             sizes=sizes,
         )
 
-    @staticmethod
-    def _dcp_scatter(
-        peer_info: KVArgsRegisterInfo,
-        prefill_kv_indices: npt.NDArray[np.int32],
-        dst_kv_indices: npt.NDArray[np.int32],
-    ) -> Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
-        """See disaggregation.dcp_scatter.dcp_scatter. Kept as a method so the
-        call site reads naturally; the mapping itself lives in a transport-free
-        module so it can be tested without standing up mori."""
-        from sglang.srt.disaggregation.dcp_scatter import dcp_scatter
-
-        return dcp_scatter(
-            peer_info.dst_dcp_size,
-            peer_info.dst_dcp_rank,
-            peer_info.dcp_swa_pages,
-            prefill_kv_indices,
-            dst_kv_indices,
-        )
-
     def send_kvcache(
         self,
         peer_info: KVArgsRegisterInfo,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
     ) -> List[TransferStatus]:
-        prefill_kv_indices, dst_kv_indices = self._dcp_scatter(
-            peer_info, prefill_kv_indices, dst_kv_indices
-        )
-        if dst_kv_indices.size == 0:
-            return []
         grouped_plan = GroupedIndexPlan.from_groups(
             *group_concurrent_contiguous(
                 prefill_kv_indices,
@@ -964,6 +1001,7 @@ class MoriKVManager(CommonKVManager):
                         src_descs[layer_id],
                         dst_descs[layer_id],
                         layer_plan,
+                        label=f"kv-mla-L{layer_id}",
                     )
                 )
             return statuses
@@ -987,6 +1025,7 @@ class MoriKVManager(CommonKVManager):
                         src_k_descs[layer_id],
                         dst_k_descs[layer_id],
                         slice_plan,
+                        label=f"kv-tp-slice-k-L{layer_id}",
                     )
                 )
                 statuses.extend(
@@ -994,6 +1033,7 @@ class MoriKVManager(CommonKVManager):
                         src_v_descs[layer_id],
                         dst_v_descs[layer_id],
                         slice_plan,
+                        label=f"kv-tp-slice-v-L{layer_id}",
                     )
                 )
             return statuses
@@ -1005,6 +1045,7 @@ class MoriKVManager(CommonKVManager):
                     src_k_descs[layer_id],
                     dst_k_descs[layer_id],
                     layer_plan,
+                    label=f"kv-k-L{layer_id}",
                 )
             )
             statuses.extend(
@@ -1012,7 +1053,238 @@ class MoriKVManager(CommonKVManager):
                     src_v_descs[layer_id],
                     dst_v_descs[layer_id],
                     layer_plan,
+                    label=f"kv-v-L{layer_id}",
                 )
+            )
+        return statuses
+
+    def send_kvcache_dcp(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        decode_prefix_len: int,
+        num_kv_tokens: Optional[int],
+        src_page_offset: int,
+    ) -> List[TransferStatus]:
+        """Generic token-position DCP relayout used by MLA/hybrid-MLA models."""
+
+        page_size = self.kv_args.page_size
+        src_page_offset = int(src_page_offset or 0)
+        capacity = int(prefill_kv_indices.size) * page_size
+        if num_kv_tokens is None:
+            num_kv_tokens = capacity
+        chunk_tokens = max(0, min(capacity, int(num_kv_tokens)))
+        if chunk_tokens > 0 and dst_kv_indices.size == 0:
+            logger.warning(
+                "PD DCP relayout dropped a non-empty chunk: chunk_tokens=%d "
+                "src_page_offset=%d dcp=%d/%d",
+                chunk_tokens,
+                src_page_offset,
+                peer_info.dst_dcp_rank,
+                peer_info.dst_dcp_size,
+            )
+            return []
+        if chunk_tokens == 0 or dst_kv_indices.size == 0:
+            return []
+
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=page_size,
+            dcp_size=peer_info.dst_dcp_size,
+            dcp_rank=peer_info.dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=chunk_tokens,
+        )
+        if plan.src_token_indices.size == 0:
+            return []
+
+        grouped_plan = GroupedIndexPlan.from_groups(
+            *group_concurrent_contiguous(
+                plan.src_token_indices.astype(np.int64),
+                plan.dst_token_indices.astype(np.int64),
+            )
+        )
+        if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
+            logger.info(
+                "[mori-bounds] generic DCP relayout rank=%d/%d pages=%d "
+                "chunk_tokens=%d src_page_offset=%d owned_tokens=%d groups=%d",
+                peer_info.dst_dcp_rank,
+                peer_info.dst_dcp_size,
+                prefill_kv_indices.size,
+                chunk_tokens,
+                src_page_offset,
+                plan.src_token_indices.size,
+                len(grouped_plan.counts),
+            )
+
+        if peer_info.decode_tp_size != self.attn_tp_size:
+            raise ValueError(
+                "PD DCP relayout combined with TP-resharding is not supported "
+                "for the mori backend"
+            )
+
+        statuses: List[TransferStatus] = []
+        if self.is_mla_backend:
+            src_descs, dst_descs, layers_current_pp_stage = (
+                self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
+            )
+            for layer_id in range(layers_current_pp_stage):
+                token_item_len = self.kv_args.kv_item_lens[layer_id] // page_size
+                layer_plan = self._build_contiguous_transfer_plan(
+                    grouped_plan, token_item_len
+                )
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        src_descs[layer_id],
+                        dst_descs[layer_id],
+                        layer_plan,
+                        label=f"kv-dcp-mla-L{layer_id}",
+                    )
+                )
+            return statuses
+
+        (
+            src_k_descs,
+            src_v_descs,
+            dst_k_descs,
+            dst_v_descs,
+            layers_current_pp_stage,
+        ) = self._get_mha_mem_desc_slices(peer_info.dst_kv_mem_descs)
+        for layer_id in range(layers_current_pp_stage):
+            token_item_len = self.kv_args.kv_item_lens[layer_id] // page_size
+            layer_plan = self._build_contiguous_transfer_plan(
+                grouped_plan, token_item_len
+            )
+            statuses.extend(
+                self._submit_batch_transfer_plan(
+                    src_k_descs[layer_id],
+                    dst_k_descs[layer_id],
+                    layer_plan,
+                    label=f"kv-dcp-k-L{layer_id}",
+                )
+            )
+            statuses.extend(
+                self._submit_batch_transfer_plan(
+                    src_v_descs[layer_id],
+                    dst_v_descs[layer_id],
+                    layer_plan,
+                    label=f"kv-dcp-v-L{layer_id}",
+                )
+            )
+        return statuses
+
+    def send_kvcache_dsv4_physical(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+    ) -> List[TransferStatus]:
+        """Transfer DSV4 main KV by compressed row and replicate its indexer."""
+
+        if peer_info.decode_tp_size != self.attn_tp_size:
+            raise ValueError(
+                "DSV4 physical DCP combined with TP-resharding is not supported"
+            )
+
+        from sglang.srt.disaggregation.dcp_scatter import (
+            build_dsv4_physical_row_transfer_plan,
+            build_dsv4_replicated_page_transfer_plan,
+            dsv4_kv_descriptor_specs,
+        )
+
+        ratios = self.kv_args.mla_compression_ratios
+        if not ratios:
+            raise RuntimeError("Missing DSV4 compression ratios for physical DCP")
+        start_layer = self.kv_args.prefill_start_layer
+        end_layer = self.kv_args.prefill_end_layer
+        specs = dsv4_kv_descriptor_specs(
+            ratios, start_layer=start_layer, end_layer=end_layer
+        )
+        src_descs, dst_descs, descriptor_count = self._get_mla_mem_desc_slices(
+            peer_info.dst_kv_mem_descs
+        )
+        if not (descriptor_count == len(specs) == len(self.kv_args.kv_item_lens)):
+            raise RuntimeError(
+                "Unexpected DSV4 KV descriptor layout: "
+                f"src={descriptor_count}, specs={len(specs)}, "
+                f"item_lens={len(self.kv_args.kv_item_lens)}"
+            )
+
+        page_plan = build_dsv4_replicated_page_transfer_plan(
+            prefill_kv_indices, dst_kv_indices
+        )
+        page_grouped = GroupedIndexPlan.from_groups(
+            *group_concurrent_contiguous(
+                page_plan.src_page_indices, page_plan.dst_page_indices
+            )
+        )
+        row_grouped: Dict[int, GroupedIndexPlan] = {}
+        statuses: List[TransferStatus] = []
+        for descriptor_id, spec in enumerate(specs):
+            item_len = self.kv_args.kv_item_lens[descriptor_id]
+            if spec.kind == "indexer":
+                # Indexer storage is not physically sharded. Replicate each page
+                # so either full scoring or page-strided scoring remains correct.
+                transfer_plan = self._build_contiguous_transfer_plan(
+                    page_grouped, item_len
+                )
+            else:
+                rows_per_page = self.kv_args.page_size // spec.compression_ratio
+                if item_len % rows_per_page != 0:
+                    raise RuntimeError(
+                        "DSV4 KV item length is not row-aligned: "
+                        f"descriptor={descriptor_id}, item_len={item_len}, "
+                        f"rows_per_page={rows_per_page}"
+                    )
+                grouped = row_grouped.get(spec.compression_ratio)
+                if grouped is None:
+                    row_plan = build_dsv4_physical_row_transfer_plan(
+                        prefill_kv_indices,
+                        dst_kv_indices,
+                        physical_page_size=self.kv_args.page_size,
+                        compression_ratio=spec.compression_ratio,
+                        dcp_size=peer_info.dst_dcp_size,
+                        dcp_rank=peer_info.dst_dcp_rank,
+                    )
+                    grouped = GroupedIndexPlan.from_groups(
+                        *group_concurrent_contiguous(
+                            row_plan.src_row_indices,
+                            row_plan.dst_row_indices,
+                        )
+                    )
+                    row_grouped[spec.compression_ratio] = grouped
+                transfer_plan = self._build_contiguous_transfer_plan(
+                    grouped, item_len // rows_per_page
+                )
+
+            statuses.extend(
+                self._submit_batch_transfer_plan(
+                    src_descs[descriptor_id],
+                    dst_descs[descriptor_id],
+                    transfer_plan,
+                    label=(
+                        f"kv-dsv4-{spec.kind}-r{spec.compression_ratio}-"
+                        f"desc{descriptor_id}"
+                    ),
+                )
+            )
+
+        if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
+            row_counts = {
+                ratio: sum(grouped.counts) for ratio, grouped in row_grouped.items()
+            }
+            logger.info(
+                "[mori-bounds] DSV4 physical relayout rank=%d/%d pages=%d "
+                "row_counts=%s descriptors=%d",
+                peer_info.dst_dcp_rank,
+                peer_info.dst_dcp_size,
+                prefill_kv_indices.size,
+                row_counts,
+                descriptor_count,
             )
         return statuses
 
@@ -1053,6 +1325,15 @@ class MoriKVManager(CommonKVManager):
             remote_offsets.append([dst_aux_index * item_len])
             sizes.append([item_len])
             uids.append(self.engine.allocate_transfer_uid())
+        if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
+            _validate_batch_write_bounds(
+                src_descs=src_descs,
+                local_offsets=local_offsets,
+                dst_descs=dst_descs,
+                remote_offsets=remote_offsets,
+                sizes=sizes,
+                label="aux",
+            )
         return list(
             self.engine.batch_write(
                 src_descs, local_offsets, dst_descs, remote_offsets, sizes, uids
@@ -1258,6 +1539,15 @@ class MoriKVManager(CommonKVManager):
                 size = bytes_to_send
 
             transfer_uid = self.engine.allocate_transfer_uid()
+            if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
+                _validate_batch_write_bounds(
+                    src_descs=[src_desc],
+                    local_offsets=[[src_offset]],
+                    dst_descs=[dst_desc],
+                    remote_offsets=[[dst_offset]],
+                    sizes=[[size]],
+                    label="state",
+                )
             batch_statuses = self.engine.batch_write(
                 [src_desc],
                 [[src_offset]],
@@ -1375,6 +1665,7 @@ class MoriKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[npt.NDArray[np.int32]]] = None,
+        num_kv_tokens: Optional[int] = None,
     ) -> Tuple[List[TransferStatus], Optional[List[TransferInfo]]]:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
 
@@ -1413,10 +1704,38 @@ class MoriKVManager(CommonKVManager):
                 peer_info = target.peer_info
 
                 if not info.is_dummy:
-                    dst_indices_chunk = info.dst_kv_indices[index_slice]
-                    result_statuses.extend(
-                        self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
+                    requires_relayout = self.requires_dcp_relayout(
+                        peer_info.dst_dcp_size, peer_info.dst_dcp_rank
                     )
+                    if requires_relayout and peer_info.dcp_swa_pages > 0:
+                        # DSV4 keeps one raw page index per physical page on both
+                        # sides; only the compressed rows inside each page are
+                        # sharded. Keep the chunk-local positional slice.
+                        dst_indices_chunk = info.dst_kv_indices[index_slice]
+                        result_statuses.extend(
+                            self.send_kvcache_dsv4_physical(
+                                peer_info, kv_indices, dst_indices_chunk
+                            )
+                        )
+                    elif requires_relayout:
+                        # Generic DCP decode arrays can be shorter than the
+                        # prefill page array. Pass the full destination array;
+                        # the planner applies src_page_offset exactly once.
+                        result_statuses.extend(
+                            self.send_kvcache_dcp(
+                                peer_info,
+                                kv_indices,
+                                info.dst_kv_indices,
+                                decode_prefix_len=info.decode_prefix_len or 0,
+                                num_kv_tokens=num_kv_tokens,
+                                src_page_offset=index_slice.start or 0,
+                            )
+                        )
+                    else:
+                        dst_indices_chunk = info.dst_kv_indices[index_slice]
+                        result_statuses.extend(
+                            self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
+                        )
 
                 if (
                     is_last_chunk
@@ -1511,6 +1830,7 @@ class MoriKVSender(CommonKVSender):
                 aux_index=self.aux_index if is_last_chunk else None,
                 normalized_state=normalized_state,
                 wait_event=wait_event,
+                num_kv_tokens=num_kv_tokens,
             )
         )
         self._maybe_finalize_if_room_failed()
@@ -1540,6 +1860,7 @@ class MoriKVSender(CommonKVSender):
             task.is_last_chunk,
             aux_index=task.aux_index,
             state_indices=task.normalized_state,
+            num_kv_tokens=task.num_kv_tokens,
         )
         self.transfer_statuses.extend(statuses)
         if infos is not None:

@@ -421,6 +421,9 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
+    # Validate every transfer entry against its registered memory regions before
+    # handing it to the backend. This is O(entries) and is intended for diagnosis.
+    SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS = EnvBool(False)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.
