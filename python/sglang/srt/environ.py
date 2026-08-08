@@ -424,6 +424,14 @@ class Envs:
     # Validate every transfer entry against its registered memory regions before
     # handing it to the backend. This is O(entries) and is intended for diagnosis.
     SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS = EnvBool(False)
+    # Digest the DSV4 compressed KV rows on both sides of a physical-DCP
+    # transfer so the relayout can be checked for byte-level fidelity offline.
+    # Reads device memory and hashes every selected row, so it is far too
+    # expensive for serving; diagnosis only.
+    SGLANG_DEBUG_DISAGG_KV_CHECKSUM = EnvBool(False)
+    # Skip digesting a descriptor whose selected row count exceeds this bound,
+    # which keeps long-context requests from dominating the run.
+    SGLANG_DEBUG_DISAGG_KV_CHECKSUM_MAX_ROWS = EnvInt(4096)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.
