@@ -577,6 +577,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+        if envs.SGLANG_DEBUG_DISAGG_KV_CHECKSUM.get() and isinstance(
+            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
+        ):
+            # Compression ratios are normally a prefill-only field. The KV
+            # checksum diagnosis needs them on this side too in order to
+            # reconstruct the descriptor layout of the rows it received.
+            kv_args.mla_compression_ratios = list(
+                self.token_to_kv_pool.compression_ratios
+            )
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,

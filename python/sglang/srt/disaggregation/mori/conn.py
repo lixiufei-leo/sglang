@@ -384,6 +384,8 @@ class MoriKVManager(CommonKVManager):
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
+        # Diagnosis only: (room, dcp_rank, descriptor) -> {dst_row: digest}.
+        self._kv_checksum_acc: Dict[Tuple[int, int, int], Dict[int, str]] = {}
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._num_shards = max(1, envs.SGLANG_MORI_TRANSFER_SHARDS.get())
@@ -1177,11 +1179,58 @@ class MoriKVManager(CommonKVManager):
             )
         return statuses
 
+    def _accumulate_kv_checksum(
+        self,
+        bootstrap_room: int,
+        dcp_rank: int,
+        descriptor_id: int,
+        base_ptr: int,
+        row_bytes: int,
+        src_rows: npt.NDArray[np.int64],
+        dst_rows: npt.NDArray[np.int64],
+    ) -> None:
+        """Digest the source rows of one chunk, keyed by destination row.
+
+        Chunked prefill sends a request in several calls, so digests accumulate
+        until the last chunk and are only emitted once the request is complete.
+        """
+
+        from sglang.srt.disaggregation import dcp_kv_checksum
+
+        src_rows = np.asarray(src_rows, dtype=np.int64).reshape(-1)
+        dst_rows = np.asarray(dst_rows, dtype=np.int64).reshape(-1)
+        if src_rows.size == 0 or src_rows.size != dst_rows.size:
+            return
+        if src_rows.size > envs.SGLANG_DEBUG_DISAGG_KV_CHECKSUM_MAX_ROWS.get():
+            return
+
+        src_digests = dcp_kv_checksum.digest_rows(base_ptr, row_bytes, src_rows)
+        if src_digests is None:
+            return
+        key = (bootstrap_room, dcp_rank, descriptor_id)
+        bucket = self._kv_checksum_acc.setdefault(key, {})
+        for src_row, dst_row in zip(src_rows, dst_rows):
+            digest = src_digests.get(int(src_row))
+            if digest is not None:
+                bucket[int(dst_row)] = digest
+
+    def _flush_kv_checksum(self, bootstrap_room: int) -> None:
+        """Emit and drop every accumulated digest for a completed request."""
+
+        from sglang.srt.disaggregation import dcp_kv_checksum
+
+        for key in [k for k in self._kv_checksum_acc if k[0] == bootstrap_room]:
+            room, dcp_rank, descriptor_id = key
+            dcp_kv_checksum.emit(
+                "prefill", room, dcp_rank, descriptor_id, self._kv_checksum_acc.pop(key)
+            )
+
     def send_kvcache_dsv4_physical(
         self,
         peer_info: KVArgsRegisterInfo,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
+        bootstrap_room: Optional[int] = None,
     ) -> List[TransferStatus]:
         """Transfer DSV4 main KV by compressed row and replicate its indexer."""
 
@@ -1191,6 +1240,7 @@ class MoriKVManager(CommonKVManager):
             )
 
         from sglang.srt.disaggregation.dcp_scatter import (
+            DSV4PhysicalRowTransferPlan,
             build_dsv4_physical_row_transfer_plan,
             build_dsv4_replicated_page_transfer_plan,
             dsv4_kv_descriptor_specs,
@@ -1223,6 +1273,7 @@ class MoriKVManager(CommonKVManager):
             )
         )
         row_grouped: Dict[int, GroupedIndexPlan] = {}
+        row_plans: Dict[int, DSV4PhysicalRowTransferPlan] = {}
         statuses: List[TransferStatus] = []
         for descriptor_id, spec in enumerate(specs):
             item_len = self.kv_args.kv_item_lens[descriptor_id]
@@ -1257,6 +1308,7 @@ class MoriKVManager(CommonKVManager):
                         )
                     )
                     row_grouped[spec.compression_ratio] = grouped
+                    row_plans[spec.compression_ratio] = row_plan
                 transfer_plan = self._build_contiguous_transfer_plan(
                     grouped, item_len // rows_per_page
                 )
@@ -1272,6 +1324,31 @@ class MoriKVManager(CommonKVManager):
                     ),
                 )
             )
+
+            if (
+                bootstrap_room is not None
+                and envs.SGLANG_DEBUG_DISAGG_KV_CHECKSUM.get()
+            ):
+                if spec.kind == "indexer":
+                    src_rows = page_plan.src_page_indices
+                    dst_rows = page_plan.dst_page_indices
+                    row_bytes = item_len
+                else:
+                    cached_plan = row_plans[spec.compression_ratio]
+                    src_rows = cached_plan.src_row_indices
+                    dst_rows = cached_plan.dst_row_indices
+                    row_bytes = item_len // (
+                        self.kv_args.page_size // spec.compression_ratio
+                    )
+                self._accumulate_kv_checksum(
+                    bootstrap_room,
+                    peer_info.dst_dcp_rank,
+                    descriptor_id,
+                    self.kv_args.kv_data_ptrs[descriptor_id],
+                    row_bytes,
+                    src_rows,
+                    dst_rows,
+                )
 
         if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
             row_counts = {
@@ -1714,7 +1791,10 @@ class MoriKVManager(CommonKVManager):
                         dst_indices_chunk = info.dst_kv_indices[index_slice]
                         result_statuses.extend(
                             self.send_kvcache_dsv4_physical(
-                                peer_info, kv_indices, dst_indices_chunk
+                                peer_info,
+                                kv_indices,
+                                dst_indices_chunk,
+                                bootstrap_room=bootstrap_room,
                             )
                         )
                     elif requires_relayout:
@@ -1769,7 +1849,15 @@ class MoriKVManager(CommonKVManager):
                 "Mori KV transfer submission failed for bootstrap_room=%s",
                 bootstrap_room,
             )
+            self._kv_checksum_acc = {
+                key: value
+                for key, value in self._kv_checksum_acc.items()
+                if key[0] != bootstrap_room
+            }
             return result_statuses, target_infos_snapshot
+
+        if is_last_chunk and envs.SGLANG_DEBUG_DISAGG_KV_CHECKSUM.get():
+            self._flush_kv_checksum(bootstrap_room)
 
         return result_statuses, target_infos_snapshot
 
@@ -2116,6 +2204,16 @@ class MoriKVReceiver(CommonKVReceiver):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
 
+        if envs.SGLANG_DEBUG_DISAGG_KV_CHECKSUM.get():
+            # Keep the destination pages so the received rows can be digested
+            # once the transfer completes.
+            self._checksum_kv_indices = np.asarray(kv_indices, dtype=np.int64).copy()
+            logger.info(
+                "[kv-checksum] decode captured room=%s pages=%d",
+                self.bootstrap_room,
+                self._checksum_kv_indices.size,
+            )
+
         kv_indices_bytes = (
             np.asarray(kv_indices, dtype=np.int32).tobytes() if kv_indices.size else b""
         )
@@ -2161,6 +2259,100 @@ class MoriKVReceiver(CommonKVReceiver):
                 return
         self.init_time = time.time()
 
+    def _emit_received_kv_checksum(self) -> None:
+        """Digest the rows this decode rank received, mirroring the prefill side.
+
+        The prefill side keys its digests by destination row, so rebuilding the
+        same ownership mapping locally makes the two logs directly comparable.
+        """
+
+        from sglang.srt.disaggregation import dcp_kv_checksum
+        from sglang.srt.disaggregation.dcp_scatter import (
+            build_dsv4_physical_row_transfer_plan,
+            dsv4_kv_descriptor_specs,
+        )
+
+        pages = getattr(self, "_checksum_kv_indices", None)
+        if pages is None or pages.size == 0:
+            logger.info(
+                "[kv-checksum] decode skip room=%s reason=no-pages pages=%s",
+                self.bootstrap_room,
+                None if pages is None else pages.size,
+            )
+            return
+        kv_args = self.kv_mgr.kv_args
+        ratios = getattr(kv_args, "mla_compression_ratios", None)
+        if not ratios:
+            logger.info(
+                "[kv-checksum] decode skip room=%s reason=no-compression-ratios",
+                self.bootstrap_room,
+            )
+            return
+        dcp_size = int(getattr(kv_args, "dcp_size", 1) or 1)
+        dcp_rank = int(getattr(kv_args, "dcp_rank", 0) or 0)
+        max_rows = envs.SGLANG_DEBUG_DISAGG_KV_CHECKSUM_MAX_ROWS.get()
+
+        emitted = 0
+        skipped: list = []
+        try:
+            # These layer bounds are populated on the prefill side; fall back to
+            # the full range so the decode side stays self-sufficient.
+            specs = dsv4_kv_descriptor_specs(
+                ratios,
+                start_layer=getattr(kv_args, "prefill_start_layer", 0) or 0,
+                end_layer=getattr(kv_args, "prefill_end_layer", None),
+            )
+            if len(specs) != len(kv_args.kv_data_ptrs):
+                logger.info(
+                    "[kv-checksum] decode skip room=%s reason=descriptor-count "
+                    "specs=%d ptrs=%d",
+                    self.bootstrap_room,
+                    len(specs),
+                    len(kv_args.kv_data_ptrs),
+                )
+                return
+            for descriptor_id, spec in enumerate(specs):
+                item_len = kv_args.kv_item_lens[descriptor_id]
+                if spec.kind == "indexer":
+                    rows = pages
+                    row_bytes = item_len
+                else:
+                    plan = build_dsv4_physical_row_transfer_plan(
+                        pages,
+                        pages,
+                        physical_page_size=kv_args.page_size,
+                        compression_ratio=spec.compression_ratio,
+                        dcp_size=dcp_size,
+                        dcp_rank=dcp_rank,
+                    )
+                    rows = plan.dst_row_indices
+                    row_bytes = item_len // (
+                        kv_args.page_size // spec.compression_ratio
+                    )
+                if rows.size == 0 or rows.size > max_rows:
+                    skipped.append((descriptor_id, int(rows.size)))
+                    continue
+                digests = dcp_kv_checksum.digest_rows(
+                    kv_args.kv_data_ptrs[descriptor_id], row_bytes, rows
+                )
+                if digests is None:
+                    skipped.append((descriptor_id, -1))
+                    continue
+                emitted += 1
+                dcp_kv_checksum.emit(
+                    "decode", self.bootstrap_room, dcp_rank, descriptor_id, digests
+                )
+            logger.info(
+                "[kv-checksum] decode done room=%s emitted=%d skipped=%d dcp=%d/%d",
+                self.bootstrap_room,
+                emitted,
+                len(skipped),
+                dcp_rank,
+                dcp_size,
+            )
+        except Exception:
+            logger.exception("[kv-checksum] decode-side digest failed")
+
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
@@ -2168,6 +2360,8 @@ class MoriKVReceiver(CommonKVReceiver):
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
+            if status == KVPoll.Success and envs.SGLANG_DEBUG_DISAGG_KV_CHECKSUM.get():
+                self._emit_received_kv_checksum()
             return status
 
         if status == KVPoll.WaitingForInput:
