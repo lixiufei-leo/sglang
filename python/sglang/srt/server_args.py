@@ -4313,9 +4313,9 @@ class ServerArgs:
 
         physical = _on("SGLANG_DSV4_DCP_PHYSICAL")
         if physical and self.disaggregation_mode != "null":
-            # Only the mori backend implements the owner filter + row remap that
-            # a sharded decode pool needs (mori/conn.py::_dcp_scatter). Any other
-            # transfer backend would write full-layout rows into a 1/dcp buffer.
+            # Only the mori backend implements the compressed-row transfer plan
+            # that a sharded decode pool needs. Any other transfer backend would
+            # write full-layout rows into a 1/dcp buffer.
             if self.disaggregation_transfer_backend != "mori":
                 raise ValueError(
                     "SGLANG_DSV4_DCP_PHYSICAL=1 shards the decode KV pool, so "

@@ -42,8 +42,14 @@ def _cached(key: tuple, factory):
 
 
 @triton.jit
-def _owner_of(slot, pos, DCP_SIZE: tl.constexpr, DCP_RANK: tl.constexpr,
-              PHYSICAL: tl.constexpr, SWA_PAGES: tl.constexpr):
+def _owner_of(
+    slot,
+    pos,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    PHYSICAL: tl.constexpr,
+    SWA_PAGES: tl.constexpr,
+):
     """(is_owned, local_row) for one entry -- mirrors _dcp_row_owner."""
     if PHYSICAL:
         is_swa = slot < SWA_PAGES

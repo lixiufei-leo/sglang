@@ -159,9 +159,7 @@ def topk_transform_512_dcp_sharded(
     masked = torch.where(valid, scores, torch.full_like(scores, neg_inf))
 
     k = min(TOPK, N)
-    local_scores, local_idx = torch.topk(
-        masked, k, dim=1, largest=True, sorted=False
-    )
+    local_scores, local_idx = torch.topk(masked, k, dim=1, largest=True, sorted=False)
 
     # Local candidate -> global physical page index, using the LOCAL page table.
     lidx = local_idx.to(torch.int64)
@@ -201,7 +199,5 @@ def topk_transform_512_dcp_sharded(
     if gather_raw:
         g_raw = dcp_group.all_gather(local_raw.contiguous(), dim=1)
         final_raw = torch.gather(g_raw, 1, m_pos)
-        final_raw = torch.where(
-            final_valid, final_raw, torch.full_like(final_raw, -1)
-        )
+        final_raw = torch.where(final_valid, final_raw, torch.full_like(final_raw, -1))
         out_raw_indices.copy_(final_raw.to(out_raw_indices.dtype))

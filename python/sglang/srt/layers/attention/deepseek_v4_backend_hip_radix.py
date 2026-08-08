@@ -86,9 +86,7 @@ def _create_flashmla_metadata():
 #     16384 -> -0.043 ms    65536 -> -0.003 ms
 #    131072 -> +0.045 ms   262144 -> +0.111 ms   2097152 -> +1.228 ms
 # Break-even sits at ~65536, so gate one doubling above it.
-_DCP_COMPACT_MIN_ENTRIES = int(
-    os.environ.get("SGLANG_DSV4_DCP_COMPACT_MIN", "131072")
-)
+_DCP_COMPACT_MIN_ENTRIES = int(os.environ.get("SGLANG_DSV4_DCP_COMPACT_MIN", "131072"))
 
 
 def _dcp_compact_streams_enabled(kv_indices: torch.Tensor) -> bool:

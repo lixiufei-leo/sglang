@@ -1050,9 +1050,7 @@ def setup_state_kv_args(
                     if getattr(token_to_kv_pool, "unified_physical_dcp", False)
                     else 1
                 )
-                kv_args.dcp_rank = int(
-                    getattr(token_to_kv_pool, "unified_dcp_rank", 0)
-                )
+                kv_args.dcp_rank = int(getattr(token_to_kv_pool, "unified_dcp_rank", 0))
                 kv_args.dcp_swa_pages = int(
                     getattr(token_to_kv_pool, "unified_swa_pages", 0)
                 )

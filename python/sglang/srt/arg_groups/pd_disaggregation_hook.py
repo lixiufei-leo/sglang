@@ -45,15 +45,16 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:
         # Fake transfer moves no KV and is only used for synthetic decode
-        # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
+        # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL/Mori.
         if server_args.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",
+            "mori",
             "fake",
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake, nixl, or fake for synthetic benchmarking, got "
+                "mooncake, nixl, or mori (or fake for synthetic benchmarking), got "
                 f"{server_args.disaggregation_transfer_backend!r}."
             )
         if server_args.disaggregation_decode_enable_radix_cache:
@@ -135,11 +136,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     if server_args.disaggregation_mode in ("prefill", "decode"):
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-            and server_args.disaggregation_transfer_backend not in ("mooncake", "nixl")
+            and server_args.disaggregation_transfer_backend
+            not in ("mooncake", "nixl", "mori")
         ):
             raise ValueError(
                 f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                f"disaggregation_transfer_backend='mooncake' or 'nixl', "
+                f"disaggregation_transfer_backend='mooncake' or 'nixl' or 'mori', "
                 f"got '{server_args.disaggregation_transfer_backend}'."
             )
 
