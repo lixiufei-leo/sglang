@@ -4228,11 +4228,13 @@ class ServerArgs:
         if self.dcp_replicate_q_proj:
             if self.dcp_size <= 1:
                 raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
-            if self.dcp_comm_backend not in ("a2a", "fi_a2a"):
+            if self.dcp_comm_backend not in ("a2a", "fi_a2a") and not is_hip():
                 raise ValueError(
                     "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
                     "communication backend (it removes the head-dim Q all-gather); "
-                    f"got --dcp-comm-backend={self.dcp_comm_backend}."
+                    f"got --dcp-comm-backend={self.dcp_comm_backend}. On AMD HIP "
+                    "the DeepSeek-V4 DCP decode path merges through its own "
+                    "_decode_dcp helper, so any dcp_comm_backend is accepted."
                 )
         if not self.dcp_size > 1:
             return

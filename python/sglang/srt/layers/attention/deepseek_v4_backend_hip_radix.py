@@ -561,6 +561,21 @@ class DeepseekV4HipRadixBackend(
         self.dcp_size = getattr(model_runner, "dcp_size", 1) or 1
         self.dcp_rank = getattr(model_runner, "dcp_rank", 0) or 0
         self._dcp_group = None
+        # --dcp-replicate-q-proj: when the model projects the whole DCP-group
+        # head range locally, the decode Q already carries all
+        # ``n_local_heads * dcp_size`` heads, so _decode_dcp skips its Q
+        # all-gather. Detected purely by head count against this precomputed
+        # value; None (unknown) keeps the always-gather behaviour.
+        self._dcp_group_q_heads = None
+        if self.dcp_size > 1:
+            try:
+                from sglang.srt.runtime_context import get_parallel
+
+                n_heads = model_runner.model_config.num_attention_heads
+                attn_tp = get_parallel().attn_tp_size
+                self._dcp_group_q_heads = (n_heads // attn_tp) * self.dcp_size
+            except Exception:
+                self._dcp_group_q_heads = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1337,7 +1352,17 @@ class DeepseekV4HipRadixBackend(
         dcp_group = self._get_dcp_group()
         # [T, H_local, D] -> [T, H_local * dcp_size, D]; rank r's heads land at
         # [r * H_local : (r+1) * H_local], matching cp_lse_ag_out_rs's slice.
-        q_full = dcp_group.all_gather(q.contiguous(), dim=1)
+        # With --dcp-replicate-q-proj the model already projects all group heads
+        # locally (q arrives with H_local * dcp_size heads), so the all-gather is
+        # skipped; head count is the discriminator (a sharded q always has fewer
+        # heads than the full group). Shapes are static under CUDA-graph capture.
+        if (
+            self._dcp_group_q_heads is not None
+            and q.shape[1] == self._dcp_group_q_heads
+        ):
+            q_full = q.contiguous()
+        else:
+            q_full = dcp_group.all_gather(q.contiguous(), dim=1)
         pool = self.token_to_kv_pool
         physical = getattr(pool, "unified_physical_dcp", False)
         swa_pages = getattr(pool, "unified_swa_pages", 0) if physical else 0
