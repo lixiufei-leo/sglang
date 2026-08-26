@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_model,
+    get_parallel,
     get_schedule,
     get_serving,
     get_spec,
@@ -420,7 +421,7 @@ class TpModelWorker(BaseTpWorker):
             self.model_config.context_len - 1,
             aggregate_dcp_kv_capacity(
                 self.model_runner.effective_max_total_num_tokens,
-                dcp_size=self.model_runner.dcp_size,
+                dcp_size=get_parallel().attn_dcp_size,
                 attention_backend=self.server_args.attention_backend,
             )
             - 1,
@@ -539,7 +540,7 @@ class TpModelWorker(BaseTpWorker):
             self.model_config.context_len - 1,
             aggregate_dcp_kv_capacity(
                 self.model_runner.effective_max_total_num_tokens,
-                dcp_size=self.model_runner.dcp_size,
+                dcp_size=get_parallel().attn_dcp_size,
                 attention_backend=self.server_args.attention_backend,
             )
             - 1,
