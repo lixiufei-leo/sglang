@@ -1347,7 +1347,10 @@ class DeepseekV4HipRadixBackend(
         # out is the *_mha variant (the _mla one reduce-scatters along tokens and
         # returns no LSE).
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
-        from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mha as cp_lse_ag_out_rs
+        from sglang.srt.layers.dcp.comm import (
+            cp_lse_ag_out_rs_mha as cp_lse_ag_out_rs,
+        )
+        from sglang.srt.layers.dcp.comm import dcp_a2a_lse_reduce
 
         dcp_group = self._get_dcp_group()
         # [T, H_local, D] -> [T, H_local * dcp_size, D]; rank r's heads land at
@@ -1405,9 +1408,28 @@ class DeepseekV4HipRadixBackend(
             physical=k_physical,
             swa_pages=k_swa_pages,
         )
-        o_nosink, global_lse = cp_lse_ag_out_rs(
-            out_shard, lse_shard, dcp_group, return_lse=True
-        )
+        # DCP reduction backend. Default "ag_rs" = all_gather(LSE) +
+        # all_reduce(out): 2 collectives/layer. "a2a" packs this rank's per-head
+        # (out, LSE) partials into ONE all_to_all (the fp32 LSE rides as
+        # output-dtype columns appended to D), then combines locally: 1
+        # collective/layer, dtype-agnostic, no GEMM blow-up. Both return this
+        # rank's head block [r*H_local:(r+1)*H_local] and its merged global LSE,
+        # so the sink fold below is identical. runtime.decode emits natural-log
+        # LSE, so is_lse_base_on_e=True. fi_a2a needs MNNVL (not on HIP), so it
+        # falls through to ag_rs here.
+        if get_parallel().dcp_comm_backend == "a2a":
+            o_nosink, global_lse = dcp_a2a_lse_reduce(
+                out_shard.contiguous(),
+                lse_shard.to(torch.float32).contiguous(),
+                dcp_group,
+                is_lse_base_on_e=True,
+                comm_backend="a2a",
+                return_lse=True,
+            )
+        else:
+            o_nosink, global_lse = cp_lse_ag_out_rs(
+                out_shard, lse_shard, dcp_group, return_lse=True
+            )
         # o_nosink: [T, H_local, D] fp32; global_lse: [T, H_local] fp32.
         # attn_sink is the full [n_heads] param; the non-DCP unified_kv kernel
         # folds attn_sink[0:H_local] (h_offs in [0, H_local)) for every rank, so
