@@ -110,6 +110,9 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+import zmq
+
+from sglang.srt.managers.dp_queue_lb import SchedulerMigrationAgent
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -149,6 +152,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MigrateBatchReq,
+    MigrateOutReq,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -783,6 +788,10 @@ class Scheduler(
 
         self.load_snapshot_writer = None
         self.recv_from_tokenizer = None
+        # Defined on every rank so non-leader ranks (attn_tp_rank != 0), which
+        # still run handle_generate_request via broadcast, don't AttributeError.
+        self.migration_agent = None
+        self._migration_context = None
 
         if not is_rank_zero:
             return
@@ -798,6 +807,33 @@ class Scheduler(
             )
         except Exception as e:
             logger.warning("load snapshot writer init failed: %s", e)
+
+        self.init_migration_agent(port_args, dp_rank)
+
+    def init_migration_agent(self, port_args: PortArgs, dp_rank: int):
+        """Init the DP waiting-queue migration mesh (queue_lb feature, Phase 1)."""
+        self.migration_agent = None
+        enabled = bool(
+            getattr(self.server_args, "enable_dp_queue_balance", False)
+            and get_parallel().config.enable_dp_attention
+        )
+        if enabled and self.ps.attn_tp_size != 1:
+            # Phase 1 does not broadcast migrated reqs inside an attn_tp group,
+            # so it only supports attn_tp_size == 1 (e.g. dp8/tp8/ep8).
+            logger.warning(
+                "enable_dp_queue_balance requires attn_tp_size == 1 "
+                "(got %s); disabling DP queue balancing on this scheduler.",
+                self.ps.attn_tp_size,
+            )
+            enabled = False
+        self._migration_context = zmq.Context(2) if enabled else None
+        self.migration_agent = SchedulerMigrationAgent(
+            context=self._migration_context,
+            port_args=port_args,
+            dp_rank=dp_rank,
+            dp_size=self.ps.dp_size,
+            enabled=enabled,
+        )
 
     def init_idle_sleeper(self) -> None:
         if (
@@ -1599,6 +1635,8 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (MigrateOutReq, self.handle_migrate_out),
+                (MigrateBatchReq, self.handle_migrate_in),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (
@@ -1789,6 +1827,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.poll_migration_inbox()
             if self._engine_paused:
                 continue
 
@@ -1833,6 +1872,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.poll_migration_inbox()
             if self._engine_paused:
                 continue
 
@@ -2541,6 +2581,11 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # queue_lb (Phase 1): keep the original tokenized input so a queued,
+            # un-prefilled request can be shipped verbatim to another DP rank.
+            if self.migration_agent is not None and self.migration_agent.enabled:
+                req.migration_src_recv_req = recv_req
+
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     recv_req.session_id
@@ -2847,6 +2892,115 @@ class Scheduler(
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                 )
+
+    def poll_migration_inbox(self):
+        """Drain peer-migrated request batches and re-enqueue them.
+
+        Called once per scheduler loop. Migrated requests arrive as their
+        original ``TokenizedGenerateReqInput`` and are re-injected through the
+        normal request path, so they behave exactly like freshly dispatched
+        requests on this DP rank (queue_lb feature, Phase 1).
+        """
+        if self.migration_agent is None or not self.migration_agent.enabled:
+            return
+        for batch in self.migration_agent.poll():
+            # Undo the pickle-field wrapping applied before the peer socket hop
+            # (mirrors SchedulerRequestReceiver.unwrap_pickle_wrapper).
+            for sub_req in batch.reqs:
+                sub_req.unwrap_pickle_fields()
+            self.process_input_requests(batch.reqs)
+
+    def _is_migratable_waiting_req(self, req: Req) -> bool:
+        """Phase 1: only migrate requests that have not started prefill.
+
+        Such a request owns no KV cache and no radix-tree prefix lock, so it can
+        be re-run verbatim on the destination rank without any state transfer.
+        """
+        return (
+            getattr(req, "migration_src_recv_req", None) is not None
+            and len(req.output_ids) == 0
+            and req.req_pool_idx is None
+            and req.kv is None
+            and (req.prefix_indices is None or len(req.prefix_indices) == 0)
+            and not req.is_retracted
+            and req.finished_reason is None
+            # Phase 1: skip multimodal / embedding requests (their side inputs
+            # are not carried over the migration mesh yet).
+            and getattr(req, "multimodal_inputs", None) is None
+            and req.input_embeds is None
+        )
+
+    def handle_migrate_out(self, recv_req: MigrateOutReq):
+        """Ship up to ``count`` queued requests to ``dst_dp_rank`` (queue_lb)."""
+        if self.migration_agent is None or not self.migration_agent.enabled:
+            return
+        if recv_req.dst_dp_rank == self.ps.dp_rank or recv_req.count <= 0:
+            return
+
+        # Pick from the tail: these are the requests scheduled last, so moving
+        # them perturbs prefix-cache locality the least.
+        picked: List[Req] = []
+        keep: List[Req] = []
+        for req in reversed(self.waiting_queue):
+            if len(picked) < recv_req.count and self._is_migratable_waiting_req(req):
+                picked.append(req)
+            else:
+                keep.append(req)
+        if not picked:
+            return
+        # `keep` was built from a reversed walk; restore original order.
+        self.waiting_queue = list(reversed(keep))
+
+        migrated_inputs = []
+        for req in picked:
+            src_input = req.migration_src_recv_req
+            # Re-target routing metadata so the destination (and any downstream
+            # bookkeeping) sees the request as belonging to the new DP rank.
+            src_input.routed_dp_rank = recv_req.dst_dp_rank
+            # Re-wrap pickle-only fields (e.g. time_stats) for the socket hop;
+            # the destination unwraps them in poll_migration_inbox().
+            src_input.wrap_pickle_fields()
+            migrated_inputs.append(src_input)
+            self._cleanup_migrated_out_req(req)
+
+        self.migration_agent.send_batch(
+            MigrateBatchReq(
+                src_dp_rank=self.ps.dp_rank,
+                dst_dp_rank=recv_req.dst_dp_rank,
+                reqs=migrated_inputs,
+            )
+        )
+        logger.info(
+            "Migrated %s queued reqs dp%s -> dp%s (queue=%s).",
+            len(migrated_inputs),
+            self.ps.dp_rank,
+            recv_req.dst_dp_rank,
+            len(self.waiting_queue),
+        )
+
+    def _cleanup_migrated_out_req(self, req: Req):
+        """Release local bookkeeping for a request leaving this rank.
+
+        The request keeps living on the destination rank under the same rid, so
+        (unlike abort) we must NOT notify the tokenizer here.
+        """
+        if self.enable_hicache_storage:
+            # Cancel any prefetch started by _prefetch_kvcache().
+            try:
+                self.tree_cache.release_aborted_request(req.rid)
+            except Exception as e:
+                logger.warning("migrate-out prefetch release failed: %s", e)
+
+    def handle_migrate_in(self, recv_req: MigrateBatchReq):
+        """Receive peer-migrated requests (queue_lb). See poll_migration_inbox.
+
+        Normally migrated batches arrive on the peer mesh and are handled by
+        poll_migration_inbox(); this dispatcher entry is a safety net for the
+        (unused) control-channel path.
+        """
+        for sub_req in recv_req.reqs:
+            sub_req.unwrap_pickle_fields()
+        self.process_input_requests(recv_req.reqs)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):

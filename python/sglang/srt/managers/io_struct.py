@@ -2047,6 +2047,33 @@ class AbortReq(BaseReq, kw_only=True):
             self.rid = ""
 
 
+class MigrateOutReq(BaseReq, kw_only=True):
+    """DP controller -> source scheduler.
+
+    Instructs the source DP rank to migrate up to ``count`` queued (un-prefilled)
+    requests to ``dst_dp_rank``. Part of the queue_lb DP waiting-queue load
+    balancing feature (Phase 1). See queue_lb/PLAN.md.
+    """
+
+    src_dp_rank: int = 0
+    dst_dp_rank: int = 0
+    count: int = 0
+
+
+class MigrateBatchReq(BaseReq, kw_only=True):
+    """Source scheduler -> destination scheduler (peer-to-peer mesh).
+
+    Carries the migrated requests as their original tokenized inputs so the
+    destination can re-enqueue them via the normal request path. Phase 1 only
+    migrates requests that have not started prefill, so no KV cache travels with
+    the message (that is Phase 2).
+    """
+
+    src_dp_rank: int = 0
+    dst_dp_rank: int = 0
+    reqs: List[TokenizedGenerateReqInput] = msgspec.field(default_factory=list)
+
+
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
 
