@@ -857,8 +857,11 @@ class Scheduler(
             is_mla = arch is not None and getattr(arch, "name", str(arch)) == "MLA"
             # DeepSeek-V4's KV pool is compressed-MLA rank-replicated (shared,
             # rank-independent storage key) even though attention_arch==MHA.
+            # NOTE: init_migration_agent runs before self.tp_worker is built, so
+            # read the already-initialized self.model_config (set above) rather
+            # than the worker's model_runner (which does not exist yet).
             try:
-                hf_cfg = self.tp_worker.model_runner.model_config.hf_config
+                hf_cfg = self.model_config.hf_config
                 is_compressed_mla = is_deepseek_v4(hf_cfg)
             except Exception:
                 is_compressed_mla = False
