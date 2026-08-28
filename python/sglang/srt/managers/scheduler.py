@@ -835,6 +835,32 @@ class Scheduler(
             enabled=enabled,
         )
 
+        # queue_lb Phase 2: also migrate queued reqs that already matched a
+        # prefix KV, bridging the prefix through the shared UMBP storage backend.
+        # Requires hicache storage (the shared L3 that both ranks read/write) and
+        # an MLA model (UMBP keys are dp-rank-independent for MLA, so the same
+        # content hash resolves on the destination). Otherwise degrade to Phase 1.
+        self.migrate_kv_enabled = False
+        if enabled and getattr(
+            self.server_args, "dp_queue_balance_migrate_kv", False
+        ):
+            arch = getattr(self.model_config, "attention_arch", None)
+            is_mla = arch is not None and getattr(arch, "name", str(arch)) == "MLA"
+            if self.enable_hicache_storage and is_mla:
+                self.migrate_kv_enabled = True
+                logger.info(
+                    "queue_lb Phase 2 KV migration enabled (hicache storage + MLA); "
+                    "matched-prefix queued reqs bridge through shared storage."
+                )
+            else:
+                logger.warning(
+                    "dp_queue_balance_migrate_kv set but requires hicache storage "
+                    "(got enable_hicache_storage=%s) and an MLA model (got is_mla=%s);"
+                    " degrading to Phase 1 (un-prefilled reqs only).",
+                    self.enable_hicache_storage,
+                    is_mla,
+                )
+
     def init_idle_sleeper(self) -> None:
         if (
             self.ps.pp_rank == 0
@@ -2930,6 +2956,44 @@ class Scheduler(
             and req.input_embeds is None
         )
 
+    def _is_kv_migratable_req(self, req: Req) -> bool:
+        """Phase 2: migrate a queued req that already matched a prefix KV.
+
+        The matched prefix lives in shared radix nodes (not owned by this req);
+        we bridge it through the shared UMBP storage backend so the destination
+        re-fetches it by content hash instead of recomputing. Superset of the
+        Phase 1 predicate: drops the "no matched prefix" restriction but still
+        requires a request that has not started decode and holds no own KV pool
+        slot (i.e. still purely queued, not mid-prefill).
+        """
+        return (
+            getattr(req, "migration_src_recv_req", None) is not None
+            and len(req.output_ids) == 0
+            and req.req_pool_idx is None
+            and req.kv is None
+            and not req.is_retracted
+            and req.finished_reason is None
+            and getattr(req, "multimodal_inputs", None) is None
+            and req.input_embeds is None
+        )
+
+    def _backup_prefix_for_migration(self, req: Req) -> None:
+        """Ensure a migrating req's matched prefix is in shared storage (UMBP).
+
+        Idempotent: skips root / already-backed-up nodes. On any failure the
+        migration still proceeds — the destination just gets a storage miss and
+        recomputes the prefix, so correctness is preserved (only locality lost).
+        """
+        node = getattr(req, "last_host_node", None) or getattr(req, "last_node", None)
+        if node is None:
+            return
+        try:
+            if self.tree_cache.is_root(node) or self.tree_cache.is_backuped(node):
+                return
+            self.tree_cache.write_backup_storage(node)
+        except Exception as e:
+            logger.warning("migrate-kv prefix backup failed for %s: %s", req.rid, e)
+
     def handle_migrate_out(self, recv_req: MigrateOutReq):
         """Ship up to ``count`` queued requests to ``dst_dp_rank`` (queue_lb)."""
         if self.migration_agent is None or not self.migration_agent.enabled:
@@ -2937,12 +3001,21 @@ class Scheduler(
         if recv_req.dst_dp_rank == self.ps.dp_rank or recv_req.count <= 0:
             return
 
+        # Phase 2: when KV migration is enabled we also move queued reqs that
+        # already matched a prefix KV (bridged via shared storage); otherwise
+        # only un-prefilled reqs move (Phase 1).
+        migratable = (
+            self._is_kv_migratable_req
+            if self.migrate_kv_enabled
+            else self._is_migratable_waiting_req
+        )
+
         # Pick from the tail: these are the requests scheduled last, so moving
         # them perturbs prefix-cache locality the least.
         picked: List[Req] = []
         keep: List[Req] = []
         for req in reversed(self.waiting_queue):
-            if len(picked) < recv_req.count and self._is_migratable_waiting_req(req):
+            if len(picked) < recv_req.count and migratable(req):
                 picked.append(req)
             else:
                 keep.append(req)
@@ -2953,6 +3026,10 @@ class Scheduler(
 
         migrated_inputs = []
         for req in picked:
+            # Phase 2: flush this req's matched prefix to shared storage before it
+            # leaves, so the destination can re-fetch it by content hash.
+            if self.migrate_kv_enabled and self.enable_hicache_storage:
+                self._backup_prefix_for_migration(req)
             src_input = req.migration_src_recv_req
             # Re-target routing metadata so the destination (and any downstream
             # bookkeeping) sees the request as belonging to the new DP rank.
@@ -2968,14 +3045,16 @@ class Scheduler(
                 src_dp_rank=self.ps.dp_rank,
                 dst_dp_rank=recv_req.dst_dp_rank,
                 reqs=migrated_inputs,
+                migrate_kv=self.migrate_kv_enabled,
             )
         )
         logger.info(
-            "Migrated %s queued reqs dp%s -> dp%s (queue=%s).",
+            "Migrated %s queued reqs dp%s -> dp%s (queue=%s, migrate_kv=%s).",
             len(migrated_inputs),
             self.ps.dp_rank,
             recv_req.dst_dp_rank,
             len(self.waiting_queue),
+            self.migrate_kv_enabled,
         )
 
     def _cleanup_migrated_out_req(self, req: Req):
