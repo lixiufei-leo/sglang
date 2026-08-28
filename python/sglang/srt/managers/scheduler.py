@@ -841,6 +841,10 @@ class Scheduler(
         # an MLA model (UMBP keys are dp-rank-independent for MLA, so the same
         # content hash resolves on the destination). Otherwise degrade to Phase 1.
         self.migrate_kv_enabled = False
+        # rids of reqs that arrived via a Phase 2 (migrate_kv) batch on THIS rank,
+        # so we can prove the storage-bridge fired (destination storage_hit>0)
+        # rather than a plain recompute. Consumed once at schedule time.
+        self._migrate_kv_in_rids = set()
         if enabled and getattr(
             self.server_args, "dp_queue_balance_migrate_kv", False
         ):
@@ -2934,6 +2938,14 @@ class Scheduler(
             # (mirrors SchedulerRequestReceiver.unwrap_pickle_wrapper).
             for sub_req in batch.reqs:
                 sub_req.unwrap_pickle_fields()
+            # Phase 2: remember which arrivals came through the KV-bridge path so
+            # we can later confirm the destination served their prefix from shared
+            # storage (storage_hit>0) instead of recomputing it.
+            if getattr(batch, "migrate_kv", False):
+                for sub_req in batch.reqs:
+                    rid = getattr(sub_req, "rid", None)
+                    if rid is not None:
+                        self._migrate_kv_in_rids.add(rid)
             self.process_input_requests(batch.reqs)
 
     def _is_migratable_waiting_req(self, req: Req) -> bool:
@@ -3716,6 +3728,20 @@ class Scheduler(
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+                # Phase 2 proof: a req that migrated in via the KV-bridge and now
+                # loaded its prefix from shared storage confirms the bridge worked
+                # (destination reused the cached prefix instead of recomputing).
+                if self._migrate_kv_in_rids:
+                    if req.rid in self._migrate_kv_in_rids:
+                        self._migrate_kv_in_rids.discard(req.rid)
+                        if loaded_tokens > 0:
+                            logger.info(
+                                "queue_lb Phase 2 storage-bridge hit: migrated req "
+                                "%s loaded %d prefix tokens from shared storage on "
+                                "this rank.",
+                                req.rid,
+                                loaded_tokens,
+                            )
 
             req.init_next_round_input(self.tree_cache)
             if (
