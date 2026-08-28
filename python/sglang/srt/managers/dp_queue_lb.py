@@ -47,11 +47,22 @@ logger = logging.getLogger(__name__)
 def migration_endpoint(port_args: "PortArgs", dp_rank: int) -> str:
     """Deterministic ipc:// endpoint for a DP rank's migration PULL socket.
 
-    Both the controller and every scheduler can compute this independently from
-    the (shared) scheduler input ipc name, so no extra port broadcast is needed.
+    Every DP-rank scheduler must derive the SAME endpoint for a given peer, so
+    the seed has to be a PortArgs field that is identical across all ranks.
+
+    ``scheduler_input_ipc_name`` and ``nccl_port`` are per-rank unique (each
+    scheduler gets its own via ``PortArgs.init_new``), so seeding on them makes
+    every rank bind/connect a different path and migrated requests are silently
+    dropped. Only ``tokenizer_ipc_name`` / ``detokenizer_ipc_name`` /
+    ``instance_id`` are explicitly kept shared across ranks
+    (see DataParallelController.launch_dp_schedulers), so seed on those.
     """
-    seed = getattr(port_args, "scheduler_input_ipc_name", None) or "sglang"
-    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+    seed = (
+        getattr(port_args, "tokenizer_ipc_name", None)
+        or getattr(port_args, "instance_id", None)
+        or "sglang"
+    )
+    digest = hashlib.sha1(str(seed).encode("utf-8")).hexdigest()[:12]
     return f"ipc:///tmp/sglang_dp_migrate_{digest}_{dp_rank}.sock"
 
 
