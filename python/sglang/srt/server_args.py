@@ -1152,10 +1152,13 @@ class ServerArgs:
     dp_queue_balance_migrate_kv: A[
         bool,
         "queue_lb Phase 2: also migrate queued requests that already matched a "
-        "prefix KV, bridging that prefix through the shared UMBP storage backend "
-        "instead of losing cache locality. Requires --enable-hierarchical-cache "
-        "with a shared --hicache-storage-backend (e.g. umbp) and an MLA model; "
-        "otherwise it degrades to Phase 1 (un-prefilled reqs only) with a warning.",
+        "prefix KV, bridging that prefix through the shared hicache storage "
+        "backend instead of losing cache locality. Requires "
+        "--enable-hierarchical-cache with a shared --hicache-storage-backend "
+        "(e.g. file or umbp) and a rank-replicated KV cache so the storage key is "
+        "dp/tp-rank independent -- true MLA models or DeepSeek-V4 (compressed-MLA "
+        "rank-replicated pool); otherwise it degrades to Phase 1 (un-prefilled "
+        "reqs only) with a warning.",
         NS("parallel"),
     ] = False
     enable_tp_lm_head_all_to_all: A[

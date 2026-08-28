@@ -838,8 +838,13 @@ class Scheduler(
         # queue_lb Phase 2: also migrate queued reqs that already matched a
         # prefix KV, bridging the prefix through the shared UMBP storage backend.
         # Requires hicache storage (the shared L3 that both ranks read/write) and
-        # an MLA model (UMBP keys are dp-rank-independent for MLA, so the same
-        # content hash resolves on the destination). Otherwise degrade to Phase 1.
+        # a RANK-REPLICATED KV cache so the storage key is dp/tp-rank independent
+        # (the same content hash resolves on the destination). That is exactly the
+        # condition hicache itself uses for a rank-independent key
+        # (cache_controller: is_rank_replicated = is_mla_model or
+        # is_compressed_mla_model): true MLA models AND DeepSeek-V4, whose
+        # DeepSeekV4TokenToKVPool is compressed-MLA rank-replicated even though its
+        # attention_arch is reported as MHA. Otherwise degrade to Phase 1.
         self.migrate_kv_enabled = False
         # rids of reqs that arrived via a Phase 2 (migrate_kv) batch on THIS rank,
         # so we can prove the storage-bridge fired (destination storage_hit>0)
@@ -850,19 +855,32 @@ class Scheduler(
         ):
             arch = getattr(self.model_config, "attention_arch", None)
             is_mla = arch is not None and getattr(arch, "name", str(arch)) == "MLA"
-            if self.enable_hicache_storage and is_mla:
+            # DeepSeek-V4's KV pool is compressed-MLA rank-replicated (shared,
+            # rank-independent storage key) even though attention_arch==MHA.
+            try:
+                hf_cfg = self.tp_worker.model_runner.model_config.hf_config
+                is_compressed_mla = is_deepseek_v4(hf_cfg)
+            except Exception:
+                is_compressed_mla = False
+            is_rank_replicated = is_mla or is_compressed_mla
+            if self.enable_hicache_storage and is_rank_replicated:
                 self.migrate_kv_enabled = True
                 logger.info(
-                    "queue_lb Phase 2 KV migration enabled (hicache storage + MLA); "
-                    "matched-prefix queued reqs bridge through shared storage."
+                    "queue_lb Phase 2 KV migration enabled (hicache storage + "
+                    "rank-replicated KV: is_mla=%s is_compressed_mla=%s); "
+                    "matched-prefix queued reqs bridge through shared storage.",
+                    is_mla,
+                    is_compressed_mla,
                 )
             else:
                 logger.warning(
                     "dp_queue_balance_migrate_kv set but requires hicache storage "
-                    "(got enable_hicache_storage=%s) and an MLA model (got is_mla=%s);"
-                    " degrading to Phase 1 (un-prefilled reqs only).",
+                    "(got enable_hicache_storage=%s) and a rank-replicated KV cache "
+                    "(got is_mla=%s is_compressed_mla=%s); degrading to Phase 1 "
+                    "(un-prefilled reqs only).",
                     self.enable_hicache_storage,
                     is_mla,
+                    is_compressed_mla,
                 )
 
     def init_idle_sleeper(self) -> None:
