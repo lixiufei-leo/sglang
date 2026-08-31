@@ -15,7 +15,10 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
-from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.attention.dsv4.index_buf_accessor import (
+    NopeFp8RopeBf16Pack,
+    fp8_dtype,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -247,6 +250,82 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
+
+
+class AtomSoaKVPool(DeepSeekV4SingleKVPool):
+    """Two-buffer SoA storage that aiter's fp8 kernels (mla_decode_fwd_v4_nm #3112,
+    pa_sparse_prefill_fp8_opus #3751) read directly, with NO in-kernel dequant.
+
+    Per (page, slot):
+        nope_scale_buffer : 512 bytes uint8 = [ nope 448 fp8 | e8m0 14 (dup) | pad 50 ]
+        rope_buffer       : 64 bf16 (separate tensor, not quantized)
+
+    Numerics are identical to the base 584B packed pool (same fp8_e4m3fn, 1x64
+    e8m0); only the byte layout differs. Additive drop-in: the base class and its
+    FlashMLA consumers are untouched.
+    """
+
+    NOPE_BLOCK = 512  # 448 nope + 14 e8m0 (dup) + 50 pad
+    ROPE_DIM = 64
+
+    def _create_buffers(self):
+        from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+
+        num_pages = (self.size + self.page_size + 1) // self.page_size
+        self._num_pages = num_pages
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.nope_scale_buffer = [
+                    torch.zeros(
+                        num_pages,
+                        self.page_size * self.NOPE_BLOCK,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.rope_buffer = [
+                    torch.zeros(
+                        num_pages,
+                        self.page_size * self.ROPE_DIM,
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+        # Compatibility: some call sites probe .kv_buffer; expose the nope block.
+        self.kv_buffer = self.nope_scale_buffer
+
+    def set_key_buffer(self, layer_id, loc, cache_nope_fp8_rope_bf16_pack):
+        from sglang.kernels.ops.attention.dsv4.atom_soa_pack import store_atom_soa
+
+        store_atom_soa(
+            self.nope_scale_buffer[layer_id],
+            self.rope_buffer[layer_id],
+            loc,
+            cache_nope_fp8_rope_bf16_pack,
+            self.page_size,
+        )
+
+    def set_key_buffer_fused(self, layer_id, loc, cache_k):
+        raise NotImplementedError("AtomSoaKVPool has no fused store yet.")
+
+    def get_nope_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        """[num_pages, page_size, 512] viewed as fp8 for the aiter kernel."""
+        buf = self.nope_scale_buffer[layer_id - self.start_layer]
+        return buf.view(fp8_dtype).view(self._num_pages, self.page_size, self.NOPE_BLOCK)
+
+    def get_rope_buffer(self, layer_id: int) -> torch.Tensor:
+        """[num_pages, page_size, 64] bf16 rope, separate tensor."""
+        buf = self.rope_buffer[layer_id - self.start_layer]
+        return buf.view(self._num_pages, self.page_size, self.ROPE_DIM)
+
+    def get_key_buffer(self, layer_id: int):
+        return self.get_nope_scale_buffer(layer_id)
 
 
 class DeepSeekV4IndexerPool(KVCache):
