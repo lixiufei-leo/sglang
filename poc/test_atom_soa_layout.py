@@ -48,7 +48,7 @@ def _quant_2buff_to_native(buf, rope):
     out = torch.empty(buf.shape[:-1] + (_QD,), dtype=dtypes.bf16, device=buf.device)
     for t in range(_QDN // _TILE):
         s, e = t * _TILE, (t + 1) * _TILE
-        out[..., s:e] = npart[..., s:e].to(dtypes.bf16) * spart[..., 2 * t].to(dtypes.bf16)
+        out[..., s:e] = npart[..., s:e].to(dtypes.bf16) * spart[..., 2 * t : 2 * t + 1].to(dtypes.bf16)
     out[..., _QDN:] = rope
     return out
 
