@@ -3010,6 +3010,35 @@ class Scheduler(
             and req.input_embeds is None
         )
 
+    def _is_pd_prefill_migratable_req(self, req: Req) -> bool:
+        """queue_lb (PD prefill): migrate a fully-bootstrapped, un-prefilled req.
+
+        Superset of the Phase 1 gate plus ``not pending_bootstrap``: the request
+        must sit in ``waiting_queue`` with its KV sender finalized
+        (``sender.init()`` done ⟺ room reached ``WaitingForInput`` ⟺ the decode
+        peer already published its transfer info), so we know the decode endpoint
+        to send the REBOOTSTRAP notification to and the handshake state is clean.
+
+        This deliberately excludes:
+          * requests mid-chunk (`self.chunked_req`, not in `waiting_queue`);
+          * requests that started prefill (`req_pool_idx`/`kv` set);
+          * optimistic re-queues (`is_retracted` after `reset_for_retract`);
+          * optimistic pre-handshake admissions (`pending_bootstrap`).
+        """
+        return (
+            getattr(req, "migration_src_recv_req", None) is not None
+            and len(req.output_ids) == 0
+            and req.req_pool_idx is None
+            and req.kv is None
+            and (req.prefix_indices is None or len(req.prefix_indices) == 0)
+            and not req.is_retracted
+            and req.finished_reason is None
+            and not getattr(req, "pending_bootstrap", False)
+            and getattr(req, "disagg_kv_sender", None) is not None
+            and getattr(req, "multimodal_inputs", None) is None
+            and req.input_embeds is None
+        )
+
     def _backup_prefix_for_migration(self, req: Req) -> None:
         """Ensure a migrating req's matched prefix is in shared storage (UMBP).
 
@@ -3033,6 +3062,12 @@ class Scheduler(
             return
         if recv_req.dst_dp_rank == self.ps.dp_rank or recv_req.count <= 0:
             return
+
+        # PD prefill uses a dedicated path: migrated reqs already hold a live KV
+        # sender + decode handshake, so we must tear that down and re-point the
+        # decode peer rather than just re-run them verbatim.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return self._handle_migrate_out_pd_prefill(recv_req)
 
         # Phase 2: when KV migration is enabled we also move queued reqs that
         # already matched a prefix KV (bridged via shared storage); otherwise
@@ -3088,6 +3123,110 @@ class Scheduler(
             recv_req.dst_dp_rank,
             len(self.waiting_queue),
             self.migrate_kv_enabled,
+        )
+
+    def _handle_migrate_out_pd_prefill(self, recv_req: MigrateOutReq):
+        """queue_lb PD prefill: migrate fully-bootstrapped, un-prefilled reqs.
+
+        For each picked request we (1) notify its decode peer to re-handshake
+        against ``dst_dp_rank`` over the KV control channel, (2) tear down the
+        local KV sender and free its metadata buffer / room state, then (3) ship
+        the original tokenized input over the migration mesh. The destination
+        re-enters it through the normal bootstrap queue and picks the handshake
+        back up under the same bootstrap_room.
+        """
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.prefill import maybe_release_metadata_buffer
+
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        kv_manager = bootstrap_queue.kv_manager
+        notify = getattr(kv_manager, "notify_decode_rebootstrap", None)
+        get_infos = getattr(kv_manager, "get_transfer_infos", None)
+        if notify is None or get_infos is None:
+            logger.warning(
+                "queue_lb: KV backend %s lacks rebootstrap support; "
+                "PD prefill migration disabled.",
+                type(kv_manager).__name__,
+            )
+            return
+
+        picked: List[Req] = []
+        keep: List[Req] = []
+        for req in reversed(self.waiting_queue):
+            if (
+                len(picked) < recv_req.count
+                and self._is_pd_prefill_migratable_req(req)
+                # Defensive: the room must actually be WaitingForInput so its
+                # decode transfer info exists to address the notification.
+                and kv_manager.request_status.get(req.bootstrap_room)
+                == KVPoll.WaitingForInput
+            ):
+                picked.append(req)
+            else:
+                keep.append(req)
+        if not picked:
+            return
+        # `keep` was built from a reversed walk; restore original order.
+        self.waiting_queue = list(reversed(keep))
+
+        migrated_inputs = []
+        for req in picked:
+            room = req.bootstrap_room
+            # 1) Address + notify the decode peer(s) BEFORE tearing the room down
+            #    (teardown clears transfer_infos, losing the decode endpoint).
+            infos = get_infos(room)
+            if not infos:
+                # No decode endpoint recorded — cannot re-point safely; keep it.
+                self.waiting_queue.append(req)
+                continue
+            notify(infos, room, recv_req.dst_dp_rank)
+
+            # 2) Tear down the local sender + room state and free the metadata
+            #    buffer. We must NOT call sender.abort(): for mori that routes
+            #    through _finalize_failure() and pushes KVPoll.Failed to the very
+            #    decode peer we just told to re-handshake, racing it into a hard
+            #    failure. Instead clear the room's local bookkeeping silently:
+            #    clear() drops request_status/transfer_infos/req_to_decode_prefix
+            #    and _cleanup_room_tracking() detaches it from the sender-side
+            #    decode-liveness tracker so no stray failure is ever emitted.
+            try:
+                req.disagg_kv_sender.clear()
+                cleanup = getattr(kv_manager, "_cleanup_room_tracking", None)
+                if cleanup is not None:
+                    cleanup(room)
+            except Exception as e:
+                logger.warning("migrate-out sender teardown failed: %s", e)
+            maybe_release_metadata_buffer(
+                req, bootstrap_queue.req_to_metadata_buffer_idx_allocator
+            )
+            req.disagg_kv_sender = None
+            req.pending_bootstrap = True
+            req.metadata_buffer_index = -1
+
+            # 3) Re-target routing metadata and ship the original tokenized input.
+            src_input = req.migration_src_recv_req
+            src_input.routed_dp_rank = recv_req.dst_dp_rank
+            src_input.wrap_pickle_fields()
+            migrated_inputs.append(src_input)
+            self._cleanup_migrated_out_req(req)
+
+        if not migrated_inputs:
+            return
+
+        self.migration_agent.send_batch(
+            MigrateBatchReq(
+                src_dp_rank=self.ps.dp_rank,
+                dst_dp_rank=recv_req.dst_dp_rank,
+                reqs=migrated_inputs,
+                migrate_kv=False,
+            )
+        )
+        logger.info(
+            "Migrated %s PD-prefill reqs dp%s -> dp%s (queue=%s).",
+            len(migrated_inputs),
+            self.ps.dp_rank,
+            recv_req.dst_dp_rank,
+            len(self.waiting_queue),
         )
 
     def _cleanup_migrated_out_req(self, req: Req):
