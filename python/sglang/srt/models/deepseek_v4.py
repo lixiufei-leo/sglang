@@ -992,12 +992,18 @@ class MQALayer(MqaAttentionBase):
         kv: Optional[torch.Tensor]
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_aiter,
             is_unified_kv_triton,
         )
 
         unified = is_unified_kv_triton()
+        # The fp8 SoA unified path has no single bf16 unified buffer and no
+        # bf16 fused SWA-store kernel; route it through the non-fused branch so
+        # the backend does the SoA store (before attention) + aiter dispatch,
+        # quantizing q internally. Only the bf16 Triton unified path fuses.
+        unified_fp8 = is_unified_kv_aiter()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        do_fused_store = (unified and is_decode) or (
+        do_fused_store = (unified and not unified_fp8 and is_decode) or (
             not unified and self.use_fused_qk_norm_rope
         )
 
