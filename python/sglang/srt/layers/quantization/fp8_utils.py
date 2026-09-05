@@ -1221,7 +1221,13 @@ def aiter_w8a8_block_fp8_linear(
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
     if use_triton:
-        gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
+        # DSV4 wo_b (7168x16384) is row-major (in the triton whitelist), so plain
+        # CK reads the same weight/scale ~1.4-1.7x faster than triton across all M.
+        gemm_a8w8_blockscale_op = (
+            ck_gemm_a8w8_blockscale
+            if (n, k) == (7168, 16384)
+            else triton_gemm_a8w8_blockscale
+        )
     elif _use_aiter_bpreshuffle_gfx95:
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
     else:
