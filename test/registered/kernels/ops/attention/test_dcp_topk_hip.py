@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_hip import (
     dcp_local_candidates_hip,
     supports_dcp_topk_hip,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
@@ -45,6 +46,10 @@ def _row_lengths(world: int) -> list[int]:
         world * _REGISTER_SCORES,
         world * _REGISTER_SCORES + 1,
         world * 17500,
+        world * 40000,  # several chunks on the chunked path
+        world * 8 * _REGISTER_SCORES,  # chunked: every chunk full
+        world * 8 * _REGISTER_SCORES
+        + world * 3,  # chunked: the last chunk re-reads its excess
     ]
 
 
@@ -120,14 +125,17 @@ def _case(world, lengths, make_scores, seed):
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
 @pytest.mark.parametrize("world", [2, 8])
 @pytest.mark.parametrize("kind", ["spread", "one_exponent"])
-def test_selects_the_global_topk_slots(world, kind):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_selects_the_global_topk_slots(world, kind, chunked):
     """The slots of exactly the top-min(len, 2048) global positions, -1 after them,
-    whichever local path (copy, radix, register tail) each rank's share takes."""
+    whichever local path (copy, radix, register tail, chunks + merge) each rank's
+    share takes."""
     lengths = _row_lengths(world)
     scores, table, span = _case(
         world, lengths, lambda n, g: _scores(kind, n, g), seed=world * 7
     )
-    out, num_owners = _dcp_topk(scores, world, table, span)
+    with envs.SGLANG_DSA_DCP_TOPK_CHUNKED.override(chunked):
+        out, num_owners = _dcp_topk(scores, world, table, span)
     out, num_owners, table = out.cpu(), num_owners.cpu(), table.cpu()
     for i, s in enumerate(scores):
         k = min(s.numel(), TOPK)
